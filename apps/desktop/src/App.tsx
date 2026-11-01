@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 type AppInfo = { name: string; version: string; platform: string };
-type Workspace = { id: string; name: string; branch: string; status: string };
+type Workspace = { id: string; name: string; branch: string; status: string; path: string; repoUrl: string | null };
 type LimaStatus = { installed: boolean; version: string | null; installSupported: boolean; installer: string | null };
 type VmStatus = { state: "notCreated" | "running" | "stopped" | string; instanceName: string; imageBytes: number | null };
 type VmProgress = { phase: string; message: string; downloadedBytes?: number | null };
@@ -29,6 +29,12 @@ function App() {
   const [vmElapsedSeconds, setVmElapsedSeconds] = useState(0);
   const [vmOutput, setVmOutput] = useState<string | null>(null);
   const [vmError, setVmError] = useState<string | null>(null);
+  const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [allowRepoNetwork, setAllowRepoNetwork] = useState(false);
+  const [workspaceCreating, setWorkspaceCreating] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [runtimeMessage, setRuntimeMessage] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
@@ -98,6 +104,39 @@ function App() {
     }
   }
 
+  function openWorkspaceDialog() {
+    setWorkspaceName("");
+    setRepoUrl("");
+    setAllowRepoNetwork(false);
+    setWorkspaceError(null);
+    setWorkspaceDialogOpen(true);
+  }
+
+  async function createWorkspace() {
+    if (vm?.state !== "running") {
+      setWorkspaceError("Start the Linux VM before creating a workspace.");
+      return;
+    }
+    setWorkspaceCreating(true);
+    setWorkspaceError(null);
+    try {
+      const workspace = await invoke<Workspace>("create_workspace", {
+        name: workspaceName,
+        repoUrl: repoUrl.trim() || null,
+        allowNetwork: allowRepoNetwork,
+      });
+      setWorkspaces((current) => [workspace, ...current]);
+      setWorkspaceDialogOpen(false);
+      setWorkspaceName("");
+      setRepoUrl("");
+      setAllowRepoNetwork(false);
+    } catch (reason) {
+      setWorkspaceError(String(reason));
+    } finally {
+      setWorkspaceCreating(false);
+    }
+  }
+
   async function runVmAction(action: "start" | "check" | "stop" | "delete") {
     const commands = { start: "start_poc_vm", check: "run_poc_check", stop: "stop_poc_vm", delete: "delete_poc_vm" } as const;
     setVmAction(action);
@@ -154,7 +193,7 @@ function App() {
     </aside>
     <section className="content">
       <header className="topbar"><span>Workspace manager</span><button className="icon-button" aria-label="Settings">⚙</button></header>
-      <div className="page-heading"><div><div className="eyebrow">YOUR DEVELOPMENT ENVIRONMENTS</div><h1>Workspaces</h1><p>Give every task its own code, services, and agent session.</p></div><button className="primary-button" disabled><span>＋</span> New workspace</button></div>
+      <div className="page-heading"><div><div className="eyebrow">YOUR DEVELOPMENT ENVIRONMENTS</div><h1>Workspaces</h1><p>Give every task its own code, services, and agent session.</p></div><button className="primary-button" onClick={openWorkspaceDialog}><span>＋</span> New workspace</button></div>
       {error && <div className="notice error">Controller connection failed: {error}</div>}
       <section className={`runtime-card ${lima?.installed ? "runtime-ready" : "runtime-needs-setup"}`} aria-live="polite">
         <div className="runtime-icon">{lima?.installed ? "✓" : "⌁"}</div>
@@ -202,11 +241,35 @@ function App() {
       </section>
       {workspaces.length === 0 ? <div className="empty-card">
         <div className="empty-illustration"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><div className="cube">◈</div><span className="spark spark-one">✳</span><span className="spark spark-two">✦</span></div>
-        <h2>Nothing here yet</h2><p>Create a workspace from a repository to give a task its own checkout,<br className="desktop-break"/> services, and place to run your coding agent.</p>
-        <button className="primary-button" disabled>＋ &nbsp;Create your first workspace</button><span className="coming-soon">Workspace provisioning is the next milestone</span>
-      </div> : <div className="workspace-list">{workspaces.map((w) => <article className="workspace-card" key={w.id}><div><b>{w.name}</b><p>{w.branch}</p></div><span className="status">{w.status}</span></article>)}</div>}
+        <h2>Nothing here yet</h2><p>Create an empty workspace inside the Linux VM.<br className="desktop-break"/> Repository import comes in the next step.</p>
+        <button className="primary-button" onClick={openWorkspaceDialog}>＋ &nbsp;Create your first workspace</button><span className="coming-soon">The workspace directory stays inside the VM</span>
+      </div> : <div className="workspace-list">{workspaces.map((w) => <article className="workspace-card" key={w.id}><div><b>{w.name}</b><p>{w.branch}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}</div><span className="status">{w.status}</span></article>)}</div>}
       <footer className="footer"><span>Local-first by design</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
+    {workspaceDialogOpen && <div className="modal-scrim">
+      <form className="workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" onSubmit={(event) => { event.preventDefault(); void createWorkspace(); }}>
+        <div className="eyebrow">NEW WORKSPACE</div>
+        <h2 id="workspace-dialog-title">Create an empty workspace</h2>
+        <p>This creates a folder inside the shared Linux VM; workspaces are directories, not separate VMs. You can optionally clone a public HTTPS repository. No host folder or credentials are shared.</p>
+        <label htmlFor="workspace-name">Workspace name</label>
+        <input id="workspace-name" autoFocus maxLength={64} value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="e.g. api-refactor" />
+        <label htmlFor="repository-url">Public HTTPS Git URL <span>(optional)</span></label>
+        <input id="repository-url" type="url" value={repoUrl} onChange={(event) => { setRepoUrl(event.target.value); setAllowRepoNetwork(false); }} placeholder="https://github.com/org/repository.git" />
+        {repoUrl.trim() && <label className="network-approval"><input type="checkbox" checked={allowRepoNetwork} onChange={(event) => setAllowRepoNetwork(event.target.checked)} />
+          I approve using this VM’s current internet connection for this clone.
+        </label>}
+        <div className={`workspace-dialog-note ${vm?.state === "running" ? "" : "needs-vm"}`}>
+          {vm?.state !== "running" ? "Start the Linux VM before creating a workspace." : repoUrl.trim() ? "Network is already enabled in this proof VM; this approval applies to the clone action only and does not firewall other guest processes." : "No network is used when creating an empty workspace."}
+        </div>
+        {workspaceError && <div className="vm-error" role="alert">{workspaceError}</div>}
+        <div className="vm-actions workspace-dialog-actions">
+          <button type="button" className="secondary-button" disabled={workspaceCreating} onClick={() => setWorkspaceDialogOpen(false)}>Cancel</button>
+          <button type="submit" className="primary-button" disabled={workspaceCreating || vm?.state !== "running" || !workspaceName.trim() || (Boolean(repoUrl.trim()) && !allowRepoNetwork)}>
+            {workspaceCreating ? <><span className="spinner"/> {repoUrl.trim() ? "Cloning…" : "Creating…"}</> : "Create workspace"}
+          </button>
+        </div>
+      </form>
+    </div>}
   </main>;
 }
 export default App;

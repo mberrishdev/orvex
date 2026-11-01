@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -17,12 +17,16 @@ struct AppInfo {
     platform: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Workspace {
     id: String,
     name: String,
     branch: String,
     status: String,
+    path: String,
+    #[serde(default)]
+    repo_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -136,6 +140,86 @@ fn app_lima_home(app: &AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&home)
         .map_err(|error| format!("Could not prepare Orvex Lima data: {error}"))?;
     Ok(home)
+}
+
+fn workspace_store_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join("workspaces.json"))
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))
+}
+
+fn read_workspaces(app: &AppHandle) -> Result<Vec<Workspace>, String> {
+    let path = workspace_store_path(app)?;
+    match std::fs::read(&path) {
+        Ok(data) => serde_json::from_slice(&data)
+            .map_err(|error| format!("Could not read workspace list: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("Could not read workspace list: {error}")),
+    }
+}
+
+fn write_workspaces(app: &AppHandle, workspaces: &[Workspace]) -> Result<(), String> {
+    let path = workspace_store_path(app)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not locate Orvex app data directory.".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not prepare Orvex app data: {error}"))?;
+    let data = serde_json::to_vec_pretty(workspaces)
+        .map_err(|error| format!("Could not encode workspace list: {error}"))?;
+    std::fs::write(path, data).map_err(|error| format!("Could not save workspace list: {error}"))
+}
+
+fn workspace_slug(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a workspace name.".into());
+    }
+    if name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("Use a name of up to 64 characters without control characters.".into());
+    }
+
+    let mut slug = String::new();
+    let mut previous_dash = true;
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        return Err("Use at least one English letter or number in the workspace name.".into());
+    }
+    Ok(slug)
+}
+
+fn validate_public_https_repo_url(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix("https://") else {
+        return Err("Repository import currently supports public HTTPS URLs only.".into());
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let has_path = rest.contains('/') && !rest.ends_with('/');
+    if value.len() > 2048
+        || value.chars().any(char::is_whitespace)
+        || value.contains(['?', '#'])
+        || authority.is_empty()
+        || authority.contains('@')
+        || !authority
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        || !has_path
+    {
+        return Err("Enter a public HTTPS Git URL without credentials or query parameters.".into());
+    }
+    Ok(value.to_owned())
 }
 
 fn run_limactl(home: &PathBuf, args: &[&str]) -> Result<std::process::Output, String> {
@@ -458,6 +542,79 @@ fn stop_poc_vm_blocking(app: &AppHandle, delete: bool) -> Result<VmStatus, Strin
     }
 }
 
+fn create_workspace_blocking(
+    app: &AppHandle,
+    name: String,
+    repo_url: Option<String>,
+    allow_network: bool,
+) -> Result<Workspace, String> {
+    let name = name.trim().to_owned();
+    let slug = workspace_slug(&name)?;
+    let repo_url = repo_url
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| validate_public_https_repo_url(&url))
+        .transpose()?;
+    if repo_url.is_some() && !allow_network {
+        return Err("Approve network access to clone this repository.".into());
+    }
+    let mut workspaces = read_workspaces(app)?;
+    if workspaces.iter().any(|workspace| workspace.id == slug) {
+        return Err(format!("A workspace named “{name}” already exists."));
+    }
+
+    let home = app_lima_home(app)?;
+    if vm_state(&home)? != "running" {
+        return Err("Start the Linux VM before creating a workspace.".into());
+    }
+
+    const CREATE_WORKSPACE_SCRIPT: &str = r#"set -eu
+root="$HOME/orvex/workspaces"
+mkdir -p "$root"
+if [ -e "$root/$2" ]; then
+  printf 'Workspace path already exists. Choose another name.\n' >&2
+  exit 17
+fi
+if [ -n "$1" ]; then
+  GIT_TERMINAL_PROMPT=0 git clone --progress -- "$1" "$root/$2"
+else
+  mkdir "$root/$2"
+  printf '# Empty workspace\n\nCreated by Orvex.\n' > "$root/$2/README.md"
+fi
+"#;
+    let output = run_limactl(
+        &home,
+        &[
+            "shell",
+            POC_INSTANCE,
+            "sh",
+            "-c",
+            CREATE_WORKSPACE_SCRIPT,
+            "orvex-workspace",
+            repo_url.as_deref().unwrap_or_default(),
+            &slug,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(output_error(&output, "create the Linux workspace"));
+    }
+
+    let workspace = Workspace {
+        id: slug.clone(),
+        name,
+        branch: if repo_url.is_some() {
+            "Repository cloned".into()
+        } else {
+            "No repository yet".into()
+        },
+        status: "Ready".into(),
+        path: format!("~/orvex/workspaces/{slug}"),
+        repo_url,
+    };
+    workspaces.push(workspace.clone());
+    write_workspaces(app, &workspaces)?;
+    Ok(workspace)
+}
+
 #[tauri::command]
 fn get_app_info() -> AppInfo {
     AppInfo {
@@ -468,8 +625,24 @@ fn get_app_info() -> AppInfo {
 }
 
 #[tauri::command]
-fn list_workspaces() -> Vec<Workspace> {
-    Vec::new()
+async fn list_workspaces(app: AppHandle) -> Result<Vec<Workspace>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_workspaces(&app))
+        .await
+        .map_err(|error| format!("Workspace list task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn create_workspace(
+    app: AppHandle,
+    name: String,
+    repo_url: Option<String>,
+    allow_network: bool,
+) -> Result<Workspace, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        create_workspace_blocking(&app, name, repo_url, allow_network)
+    })
+    .await
+    .map_err(|error| format!("Workspace creation task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -532,6 +705,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             list_workspaces,
+            create_workspace,
             get_lima_status,
             install_lima,
             get_vm_status,
