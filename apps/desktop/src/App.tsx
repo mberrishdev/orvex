@@ -35,6 +35,8 @@ function App() {
   const [allowRepoNetwork, setAllowRepoNetwork] = useState(false);
   const [workspaceCreating, setWorkspaceCreating] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [terminalAction, setTerminalAction] = useState<string | null>(null);
+  const [terminalError, setTerminalError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [runtimeMessage, setRuntimeMessage] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
@@ -137,6 +139,21 @@ function App() {
     }
   }
 
+  async function openWorkspaceTerminal(workspace: Workspace, networkEnabled: boolean) {
+    if (networkEnabled && !window.confirm(
+      `Open a terminal for “${workspace.name}” with the Linux VM's current network access?\n\nThis allows the shell and commands it starts to access the internet and reachable host or LAN services.`,
+    )) return;
+    setTerminalAction(`${workspace.id}:${networkEnabled ? "online" : "offline"}`);
+    setTerminalError(null);
+    try {
+      await invoke("open_workspace_terminal", { workspaceId: workspace.id, networkEnabled });
+    } catch (reason) {
+      setTerminalError(`${workspace.name}: ${String(reason)}`);
+    } finally {
+      setTerminalAction(null);
+    }
+  }
+
   async function runVmAction(action: "start" | "check" | "stop" | "delete") {
     const commands = { start: "start_poc_vm", check: "run_poc_check", stop: "stop_poc_vm", delete: "delete_poc_vm" } as const;
     setVmAction(action);
@@ -218,7 +235,7 @@ function App() {
         </div>
         <p className="vm-description">Start an app-owned Lima VM, run a fixed <code>uname -a</code> check, then stop or delete it. Host folders are not mounted and containerd is off.</p>
         <p className="vm-image-cache">{vm?.imageBytes != null ? `Ubuntu image cached · ${Math.floor(vm.imageBytes / 1024).toLocaleString()} KB` : "Ubuntu image not downloaded yet"}</p>
-        <div className="network-consent"><strong>Network access is enabled for this proof.</strong> The guest can reach the internet and services on your Mac’s loopback address. Starting it is always a manual action.</div>
+        <div className="network-consent"><strong>The Lima VM itself has network access.</strong> Open Terminal starts offline inside a Linux network namespace with no active network interface or route. Choose “Open with network” to grant that terminal the VM’s network access. Other guest processes remain networked.</div>
         {vmError && <div className="vm-error">{vmError}</div>}
         {vmOutput && <pre className="vm-output">{vmOutput}</pre>}
         {vmAction === "start" && <div className="vm-progress" role="status" aria-live="polite">
@@ -239,11 +256,12 @@ function App() {
           {vm && vm.state !== "notCreated" && <button className="secondary-button" disabled={vmAction !== null} onClick={deleteVm}>{vmAction === "delete" ? "Deleting…" : "Delete VM"}</button>}
         </div>
       </section>
+      {terminalError && <div className="notice error" role="alert">{terminalError}</div>}
       {workspaces.length === 0 ? <div className="empty-card">
         <div className="empty-illustration"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><div className="cube">◈</div><span className="spark spark-one">✳</span><span className="spark spark-two">✦</span></div>
         <h2>Nothing here yet</h2><p>Create an empty workspace inside the Linux VM.<br className="desktop-break"/> Repository import comes in the next step.</p>
         <button className="primary-button" onClick={openWorkspaceDialog}>＋ &nbsp;Create your first workspace</button><span className="coming-soon">The workspace directory stays inside the VM</span>
-      </div> : <div className="workspace-list">{workspaces.map((w) => <article className="workspace-card" key={w.id}><div><b>{w.name}</b><p>{w.branch}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}</div><span className="status">{w.status}</span></article>)}</div>}
+      </div> : <div className="workspace-list">{workspaces.map((w) => <article className="workspace-card" key={w.id}><div className="workspace-details"><b>{w.name}</b><p>{w.branch}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}</div><div className="workspace-controls"><span className="status">{w.status}</span><div className="workspace-terminal-actions"><button className="secondary-button" disabled={vm?.state !== "running" || terminalAction !== null} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={vm?.state !== "running" || terminalAction !== null} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div></div></article>)}</div>}
       <footer className="footer"><span>Local-first by design</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
     {workspaceDialogOpen && <div className="modal-scrim">

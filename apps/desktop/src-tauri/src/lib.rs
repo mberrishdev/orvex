@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -419,6 +419,159 @@ fn vm_state(home: &PathBuf) -> Result<String, String> {
     Ok("notCreated".to_owned())
 }
 
+fn guest_user(home: &Path) -> Result<(String, PathBuf, bool, u32, u32), String> {
+    let output = run_limactl(&home.to_path_buf(), &["list", "--json"])?;
+    if !output.status.success() {
+        return Err(output_error(&output, "read Linux user configuration"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let instance: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("Could not parse Lima instance configuration: {error}"))?;
+        if instance.get("name").and_then(|name| name.as_str()) != Some(POC_INSTANCE) {
+            continue;
+        }
+        let user = instance
+            .get("config")
+            .and_then(|config| config.get("user"))
+            .ok_or_else(|| "Lima does not report the guest user configuration.".to_owned())?;
+        let name = user
+            .get("name")
+            .and_then(|name| name.as_str())
+            .ok_or_else(|| "Lima does not report the guest user name.".to_owned())?;
+        let guest_home = user
+            .get("home")
+            .and_then(|path| path.as_str())
+            .ok_or_else(|| "Lima does not report the guest home directory.".to_owned())?;
+        let passwordless_sudo = user
+            .get("passwordlessSudo")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let uid = user
+            .get("uid")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "Lima does not report the guest user ID.".to_owned())?;
+        let gid = user
+            .get("gid")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "Lima does not report the guest group ID.".to_owned())?;
+        return Ok((
+            name.to_owned(),
+            PathBuf::from(guest_home),
+            passwordless_sudo,
+            uid,
+            gid,
+        ));
+    }
+    Err("The Orvex Linux VM has not been created.".into())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn open_workspace_terminal_blocking(
+    app: &AppHandle,
+    workspace_id: String,
+    network_enabled: bool,
+) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Opening a Lima workspace terminal is currently supported on macOS only.".into(),
+        );
+    }
+    let slug = workspace_slug(&workspace_id)?;
+    if slug != workspace_id {
+        return Err("The workspace identifier is invalid.".into());
+    }
+    let workspaces = read_workspaces(app)?;
+    if !workspaces.iter().any(|workspace| workspace.id == slug) {
+        return Err("That workspace is not in the Orvex workspace list.".into());
+    }
+
+    let home = app_lima_home(app)?;
+    if vm_state(&home)? != "running" {
+        return Err("Start the Linux VM before opening a workspace terminal.".into());
+    }
+    let (guest_user, guest_home, passwordless_sudo, guest_uid, guest_gid) = guest_user(&home)?;
+    if !network_enabled && !passwordless_sudo {
+        return Err(
+            "Offline terminals need passwordless sudo to create a Linux network namespace.".into(),
+        );
+    }
+    if !network_enabled && (guest_uid == 0 || guest_gid == 0) {
+        return Err("Offline terminals need a non-root Lima guest user.".into());
+    }
+    let guest_path = guest_home.join("orvex/workspaces").join(&slug);
+    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let path_check = run_limactl(
+        &home,
+        &["shell", POC_INSTANCE, "test", "-d", &guest_path_text],
+    )?;
+    if !path_check.status.success() {
+        return Err(format!(
+            "Workspace folder was not found in Linux: {guest_path_text}"
+        ));
+    }
+
+    let limactl = find_executable("limactl")
+        .ok_or_else(|| "Lima is not installed. Install it before opening a terminal.".to_owned())?;
+    let limactl_text = limactl.to_string_lossy();
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?;
+    let sessions = app_data.join("terminal-sessions");
+    std::fs::create_dir_all(&sessions)
+        .map_err(|error| format!("Could not prepare terminal session files: {error}"))?;
+    let mode = if network_enabled { "online" } else { "offline" };
+    let script_path = sessions.join(format!("{slug}-{mode}.command"));
+
+    let command = if network_enabled {
+        format!(
+            "exec {} shell --workdir {} {} bash -l\n",
+            shell_quote(&limactl_text),
+            shell_quote(&guest_path_text),
+            shell_quote(POC_INSTANCE),
+        )
+    } else {
+        let guest_command = format!("cd {} && exec bash -l", shell_quote(&guest_path_text));
+        format!(
+            "exec {} shell --workdir {} {} sudo -n unshare --user --map-users=0:0:1 --map-users={guest_uid}:{guest_uid}:1 --map-groups=0:0:1 --map-groups={guest_gid}:{guest_gid}:1 --net --fork -- su -s /bin/bash -c {} {}\n",
+            shell_quote(&limactl_text),
+            shell_quote(&guest_path_text),
+            shell_quote(POC_INSTANCE),
+            shell_quote(&guest_command),
+            shell_quote(&guest_user),
+        )
+    };
+    let script = format!(
+        "#!/bin/zsh\nexport LIMA_HOME={}\n{}",
+        shell_quote(&home.to_string_lossy()),
+        command
+    );
+    std::fs::write(&script_path, script)
+        .map_err(|error| format!("Could not prepare the terminal command: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not secure the terminal command: {error}"))?;
+    }
+
+    let output = Command::new("/usr/bin/open")
+        .args(["-a", "Terminal"])
+        .arg(&script_path)
+        .output()
+        .map_err(|error| format!("Could not open Terminal: {error}"))?;
+    if !output.status.success() {
+        return Err(output_error(&output, "open Terminal"));
+    }
+    Ok(())
+}
+
 fn cached_lima_image_bytes() -> Option<u64> {
     let home = std::env::var_os("HOME")?;
     let cache = PathBuf::from(home).join("Library/Caches/lima/download/by-url-sha256");
@@ -646,6 +799,19 @@ async fn create_workspace(
 }
 
 #[tauri::command]
+async fn open_workspace_terminal(
+    app: AppHandle,
+    workspace_id: String,
+    network_enabled: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_workspace_terminal_blocking(&app, workspace_id, network_enabled)
+    })
+    .await
+    .map_err(|error| format!("Terminal task failed: {error}"))?
+}
+
+#[tauri::command]
 fn get_lima_status() -> LimaStatus {
     inspect_lima()
 }
@@ -706,6 +872,7 @@ pub fn run() {
             get_app_info,
             list_workspaces,
             create_workspace,
+            open_workspace_terminal,
             get_lima_status,
             install_lima,
             get_vm_status,
