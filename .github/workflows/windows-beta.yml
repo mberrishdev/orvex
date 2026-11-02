@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v*-beta.*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing beta tag to build and publish (blank builds branch artifacts only)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -19,7 +24,15 @@ jobs:
     env:
       CARGO_INCREMENTAL: '0'
     steps:
+      - name: Validate requested beta tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          if ($env:REQUESTED_TAG -and $env:REQUESTED_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$') { throw 'Expected a beta version tag.' }
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -28,6 +41,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build frontend assets for Rust tests
+        run: pnpm --filter @orvex/desktop build
       - name: Test shared Rust code
         run: cargo test --locked --workspace --lib --features custom-protocol
       - name: Build Windows installer
@@ -50,7 +65,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || inputs.tag != ''
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -64,7 +79,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           cat > /tmp/release-notes.txt <<'NOTES'
           Windows x64 interface and installer beta.
