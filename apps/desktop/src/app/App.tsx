@@ -2,27 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import "./App.css";
-
-type AppInfo = { name: string; version: string; platform: string };
-type Workspace = { id: string; name: string; branch: string; baseBranch: string | null; status: string; path: string; repoUrl: string | null; vmName: string | null; agentProviders: string[]; composeFile: string | null };
-type LimaStatus = { installed: boolean; version: string | null; installSupported: boolean; installer: string | null };
-type VmStatus = { state: "notCreated" | "running" | "stopped" | string; instanceName: string; imageBytes: number | null };
-type VmProgress = { phase: string; message: string; downloadedBytes?: number | null; workspaceId?: string };
-type AgentProvider = { id: string; name: string; executable: string; loginHint: string };
-type AgentInstallResult = { providerId: string; providerName: string; installed: boolean; version: string | null; message: string; loginHint: string };
-type AgentPreflight = { workspaceId: string; providerId: string; providerName: string; installed: boolean; version: string | null; message: string; loginHint: string };
-type WorkspaceCreationResult = { workspace: Workspace; agentInstallations: AgentInstallResult[]; setupCommands: string[]; setupError: string | null };
-type ProjectSetupResult = { commands: string[]; completed: number; failedCommand: string | null; message: string };
-type WorkspaceServices = {
-  workspaceId: string;
-  composeFile: string | null;
-  dockerInstalled: boolean;
-  vmIp: string | null;
-  output: string;
-  containers: { service: string; state: string; health: string }[];
-  ports: { service: string; targetPort: number; publishedPort: number; protocol: string; url: string | null }[];
-};
+import "../styles/workspaces.css";
+import { Sidebar } from "../features/workspaces/Sidebar";
+import { McpStatus } from "../features/workspaces/McpStatus";
+import { useMcpStatus } from "../features/workspaces/useMcpStatus";
+import { BrandMark } from "../components/BrandMark";
+import type { AppInfo, Workspace, LimaStatus, VmStatus, VmProgress, AgentProvider, AgentInstallResult, AgentPreflight, WorkspaceCreationResult, ProjectSetupResult, WorkspaceServices } from "../features/workspaces/types";
 
 const vmStages = [
   { phase: "checking", label: "Check" },
@@ -38,6 +23,8 @@ function workspaceSlugPreview(name: string) {
 }
 
 function App() {
+  const mcpStatus = useMcpStatus();
+  const [workspaceFilter, setWorkspaceFilter] = useState<"all" | "running">("all");
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceVms, setWorkspaceVms] = useState<Record<string, VmStatus>>({});
@@ -85,9 +72,16 @@ function App() {
   const [runtimeMessage, setRuntimeMessage] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshInFlight = useRef(false);
 
-  useEffect(() => {
-    Promise.all([
+  async function refreshWorkspaces() {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    setRefreshing(true);
+    setError(null);
+    await mcpStatus.refresh();
+    await Promise.all([
       invoke<AppInfo>("get_app_info"),
       invoke<Workspace[]>("list_workspaces"),
       invoke<LimaStatus>("get_lima_status"),
@@ -129,7 +123,12 @@ function App() {
         }));
         setWorkspaceServices(Object.fromEntries(serviceStates.filter((entry): entry is readonly [string, WorkspaceServices] => entry !== null)));
       })
-      .catch((reason: unknown) => setError(String(reason)));
+      .catch((reason: unknown) => setError(`Could not refresh workspaces: ${String(reason)}`))
+      .finally(() => { refreshInFlight.current = false; setRefreshing(false); });
+  }
+
+  useEffect(() => {
+    void refreshWorkspaces();
   }, []);
 
   useEffect(() => {
@@ -245,30 +244,8 @@ function App() {
       setAllowVmNetwork(false);
       setSelectedAgents([]);
       setWorkspaceVmProgress((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
-      if (result.setupCommands.length > 0) {
-        const approved = window.confirm(
-          `This repository declares setup commands in .orvex/workspace.json:\n\n${result.setupCommands.map((command, index) => `${index + 1}. ${command}`).join("\n")}\n\nRun these commands inside the workspace VM?`,
-        );
-        if (approved) {
-          setWorkspaceSetupResults((current) => ({
-            ...current,
-            [workspace.id]: { commands: result.setupCommands, completed: 0, failedCommand: null, message: "Running project setup commands…" },
-          }));
-          try {
-            const setupResult = await invoke<ProjectSetupResult>("run_workspace_setup", {
-              workspaceId: workspace.id,
-              approvedCommands: result.setupCommands,
-            });
-            setWorkspaceSetupResults((current) => ({ ...current, [workspace.id]: setupResult }));
-          } catch (reason) {
-            setWorkspaceSetupErrors((current) => ({ ...current, [workspace.id]: String(reason) }));
-          }
-        } else {
-          setWorkspaceSetupResults((current) => ({
-            ...current,
-            [workspace.id]: { commands: result.setupCommands, completed: 0, failedCommand: null, message: "Setup skipped. Run these commands manually from the workspace terminal." },
-          }));
-        }
+      if (result.setupResult) {
+        setWorkspaceSetupResults((current) => ({ ...current, [workspace.id]: result.setupResult as ProjectSetupResult }));
       }
     } catch (reason) {
       setWorkspaceError(String(reason));
@@ -463,19 +440,13 @@ function App() {
   }
 
   return <main className="shell">
-    <aside className="sidebar">
-      <div className="brand"><span className="brand-mark">◈</span> orvex</div>
-      <div className="side-label">WORKSPACES</div>
-      <button className="nav-item selected"><span>▦</span> All tasks <span className="count">{workspaces.length}</span></button>
-      <button className="nav-item"><span>◷</span> Recent</button>
-      <div className="side-label projects-label">PROJECTS</div>
-      <div className="empty-projects">Your projects will appear here.</div>
-      <div className="sidebar-bottom"><div className="runtime-dot"/><div><strong>{info?.platform ?? "Connecting…"}</strong><small>Local controller</small></div><span className="connected">●</span></div>
-    </aside>
+    <Sidebar workspaces={workspaces} runningCount={workspaces.filter(w => workspaceVms[w.id]?.state === "running").length} filter={workspaceFilter} onFilter={setWorkspaceFilter} platform={info?.platform} runtimeReady={!!lima?.installed} />
     <section className="content">
-      <header className="topbar"><span>Workspace manager</span><button className="icon-button" aria-label="Settings">⚙</button></header>
-      <div className="page-heading"><div><div className="eyebrow">YOUR DEVELOPMENT ENVIRONMENTS</div><h1>Workspaces</h1><p>Give every task its own code, services, and agent session.</p></div><button className="primary-button" onClick={openWorkspaceDialog}><span>＋</span> New workspace</button></div>
+      <header className="topbar" data-tauri-drag-region><span>Orvex <span className="breadcrumb-divider">/</span> Workspaces</span><div className="topbar-actions"><span className="topbar-local"><span className="local-indicator"/> On your machine</span><button type="button" className="secondary-button refresh-button" aria-label="Refresh workspaces" aria-busy={refreshing} disabled={refreshing || workspaceCreating || workspaceDeleting !== null || workspaceVmAction !== null || vmAction !== null || workspaceServiceAction !== null} onClick={() => void refreshWorkspaces()}><svg className={refreshing ? "refresh-icon spinning" : "refresh-icon"} width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3a7 7 0 0 0 11.5-1"/></svg>{refreshing ? "Refreshing…" : "Refresh"}</button></div></header>
+      <div className="page-heading"><div><div className="eyebrow">YOUR SPACE TO BUILD</div><h1>Workspaces</h1><p>A fresh environment for every idea. All on your machine.</p></div><button className="primary-button" onClick={openWorkspaceDialog}><span aria-hidden="true">＋</span> New workspace</button></div>
+      <div className="workspace-overview" aria-label="Workspace overview"><div><span>Workspaces</span><strong>{workspaces.length}</strong></div><div><span><i className="overview-dot"/> Running</span><strong>{workspaces.filter(w => workspaceVms[w.id]?.state === "running").length}</strong></div><div><span>Stopped</span><strong>{workspaces.filter(w => workspaceVms[w.id]?.state === "stopped").length}</strong></div><p>Independent code.<br/>Room to experiment.</p></div>
       {error && <div className="notice error">Controller connection failed: {error}</div>}
+      <div className="integration-grid">
       <section className={`runtime-card ${lima?.installed ? "runtime-ready" : "runtime-needs-setup"}`} aria-live="polite">
         <div className="runtime-icon">{lima?.installed ? "✓" : "⌁"}</div>
         <div className="runtime-copy">
@@ -492,6 +463,8 @@ function App() {
               {installing ? <><span className="spinner"/> Installing…</> : "Install Lima"}
             </button>}
       </section>
+      <McpStatus status={mcpStatus.status} error={mcpStatus.error} />
+      </div>
       {workspaces.some((workspace) => !workspace.vmName) && <section className="vm-card" aria-live="polite">
         <div className="vm-heading">
           <div><div className="eyebrow">EXISTING WORKSPACES</div><h2>Legacy shared VM</h2></div>
@@ -522,20 +495,21 @@ function App() {
       </section>}
       {terminalError && <div className="notice error" role="alert">{terminalError}</div>}
       {workspaceVmError && <div className="notice error" role="alert">{workspaceVmError}</div>}
+      {workspaceFilter === "running" && workspaces.length > 0 && !workspaces.some(w => workspaceVms[w.id]?.state === "running") && <div className="filter-empty"><span>◌</span><h2>A quiet moment.</h2><p>No workspaces are running. Start one whenever you’re ready.</p><button className="secondary-button" onClick={() => setWorkspaceFilter("all")}>View all workspaces</button></div>}
       {workspaces.length === 0 ? <div className="empty-card">
-        <div className="empty-illustration"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><div className="cube">◈</div><span className="spark spark-one">✳</span><span className="spark spark-two">✦</span></div>
+        <div className="empty-illustration"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><div className="cube"><BrandMark /></div></div>
         <h2>Nothing here yet</h2><p>Create a workspace with its own Linux VM.<br className="desktop-break"/> Its code and lifecycle stay separate from other workspaces.</p>
         <button className="primary-button" onClick={openWorkspaceDialog}>＋ &nbsp;Create your first workspace</button><span className="coming-soon">Each workspace uses a separate Linux VM</span>
-      </div> : <div className="workspace-list">{workspaces.map((w) => {
+      </div> : <div className="workspace-list">{workspaces.filter(w => workspaceFilter === "all" || workspaceVms[w.id]?.state === "running").map((w) => {
         const workspaceVm = workspaceVms[w.id];
         const state = workspaceVm?.state ?? "checking";
         const isLegacy = !w.vmName;
         const vmActionBusy = workspaceVmAction?.startsWith(`${w.id}:`) ?? false;
-        return <article className="workspace-card" key={w.id}>
-          <div className="workspace-details"><b>{w.name}</b><p>{w.branch}{w.baseBranch ? ` · from ${w.baseBranch}` : ""}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}
+        return <article className="workspace-card" id={`workspace-${w.id}`} key={w.id}>
+          <div className="workspace-details"><div className="workspace-card-title"><span className="workspace-glyph" aria-hidden="true">⌘</span><b>{w.name}</b></div><p>{w.branch}{w.baseBranch ? ` · from ${w.baseBranch}` : ""}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}
             <span className={`runtime-badge ${state === "running" ? "ready" : "needs-setup"}`}>{isLegacy ? "SHARED LEGACY VM" : `WORKSPACE VM · ${state.toUpperCase()}`}</span>
           </div>
-          <div className="workspace-controls"><span className="status">{w.status}</span>
+          <div className="workspace-controls">
             <div className="workspace-terminal-actions">
               {!isLegacy && state !== "running" && <button className="primary-button" disabled={!lima?.installed || vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "start")}>{workspaceVmAction === `${w.id}:start` ? <><span className="spinner"/> Starting…</> : state === "stopped" ? "Resume VM" : "Start VM"}</button>}
               {!isLegacy && state === "running" && <button className="secondary-button" disabled={vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "stop")}>{workspaceVmAction === `${w.id}:stop` ? "Stopping…" : "Stop VM"}</button>}
@@ -547,11 +521,11 @@ function App() {
             {!isLegacy && workspaceVmAction === `${w.id}:start` && <small className="runtime-feedback">{workspaceVmProgress[w.id]?.message ?? "Starting this workspace's VM…"}</small>}
             <div className="workspace-terminal-actions"><button className="secondary-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div>
           </div>
-          {!isLegacy && w.agentProviders.length > 0 && <section className="workspace-agent-readiness" aria-label={`Coding CLI readiness for ${w.name}`}>
-            <div className="workspace-agent-readiness-heading">
+          {!isLegacy && w.agentProviders.length > 0 && <details className="workspace-agent-readiness" aria-label={`Coding CLI readiness for ${w.name}`}>
+            <summary className="workspace-agent-readiness-heading">
               <strong>Coding CLI readiness</strong>
               <small>Checks installation and version only. Orvex will not start an agent here.</small>
-            </div>
+            </summary>
             {w.agentProviders.map((providerId) => {
               const key = `${w.id}:${providerId}`;
               const provider = agentProviders.find((item) => item.id === providerId);
@@ -569,7 +543,7 @@ function App() {
                 </button>
               </div>;
             })}
-          </section>}
+          </details>}
           {!isLegacy && w.composeFile && <section className="workspace-services" aria-label={`Services for ${w.name}`}>
             <div className="workspace-services-heading"><strong>Docker Compose</strong><small>{w.composeFile}</small></div>
             <div className="workspace-services-actions">
@@ -601,7 +575,7 @@ function App() {
           {workspaceSetupErrors[w.id] && <small className="workspace-setup-result workspace-setup-failed">Setup config: {workspaceSetupErrors[w.id]}</small>}
         </article>;
       })}</div>}
-      <footer className="footer"><span>Local-first by design</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
+      <footer className="footer"><span>Made for a little more focus.</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
     <dialog ref={deleteDialogRef} className="workspace-dialog workspace-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-workspace-title" aria-describedby="delete-workspace-description" onCancel={(event) => { event.preventDefault(); if (workspaceDeleting === null) setPendingWorkspaceDelete(null); }}>
       {pendingWorkspaceDelete && <>
@@ -640,7 +614,7 @@ function App() {
         {agentProviderError && <div className="vm-error" role="alert">Could not load coding CLI options: {agentProviderError}</div>}
         <div className="workspace-dialog-note">Selected tools are installed inside this VM only. Their account sign-in remains yours to complete.</div>
         <label className="network-approval"><input type="checkbox" checked={allowVmNetwork} onChange={(event) => setAllowVmNetwork(event.target.checked)} />
-          I approve downloading Linux and giving this workspace VM internet access{repoUrl.trim() ? ", including cloning this repository" : ""}.
+          I approve downloading Linux, installing project dependencies, running declared setup commands, and giving this workspace VM internet access{repoUrl.trim() ? ", including cloning this repository" : ""}.
         </label>
         <div className="workspace-dialog-note needs-vm">This approval enables the VM's network; Orvex does not yet enforce a per-VM firewall. The VM can remain online after creation.</div>
         {workspaceCreating && <div className="vm-progress" role="status" aria-live="polite"><div className="vm-progress-current"><span className="spinner"/><div><strong>{workspaceVmProgress[workspaceSlugPreview(workspaceName)]?.message ?? "Creating the dedicated Linux VM…"}</strong><small>First creation downloads and prepares Ubuntu.</small></div></div></div>}

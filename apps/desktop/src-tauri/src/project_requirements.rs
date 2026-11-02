@@ -17,7 +17,7 @@ pub(crate) struct Requirements {
     configuration_keys: Vec<Value>,
     commit: String,
     scope: &'static str,
-    automatic_setup: bool,
+    pub(crate) automatic_setup: bool,
 }
 
 fn relevant(path: &str) -> bool {

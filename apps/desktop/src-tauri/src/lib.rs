@@ -1,3 +1,4 @@
+mod mcp_connections;
 mod environment_plan;
 mod project_configuration;
 mod project_requirements;
@@ -65,6 +66,7 @@ struct WorkspaceCreationResult {
     agent_installations: Vec<AgentInstallResult>,
     setup_commands: Vec<String>,
     setup_error: Option<String>,
+    setup_result: Option<ProjectSetupResult>,
     requirements: Option<project_requirements::Requirements>,
 }
 
@@ -1771,16 +1773,31 @@ fi
     if requirements.as_ref().is_some_and(|report| report.linux_compatibility == "unsupported") && !allow_unsupported_platform {
         return Err("The cloned project requires Xcode/Apple SDKs and cannot run in Linux. The newly allocated VM will be cleaned up. Use allowUnsupportedPlatform=true only for an intentional source-editing workspace.".into());
     }
-    let (project_config, setup_error) = match discover_project_config(&home, &instance_name, &slug) {
+    let (project_config, mut setup_error) = match discover_project_config(&home, &instance_name, &slug) {
         Ok(config) => (config, None),
         Err(error) => (ProjectConfig { setup_commands: Vec::new(), compose_file: None }, Some(error)),
     };
+    // Creation authorizes project dependency installation inside this dedicated VM.
+    // Keep a failed setup's checkout available for diagnosis, but never report it ready.
+    let setup_result = if setup_error.is_none() && (snapshot.is_some() || repo_url.is_some()) {
+        let needs_docker = project_config.compose_file.is_some() || requirements.as_ref().is_some_and(|report|
+            report.evidence.iter().any(|item| item["kind"] == "container"));
+        match provision_workspace_dependencies(&home, &instance_name, &slug, &project_config, needs_docker) {
+            Ok(result) => {
+                if result.failed_command.is_some() { setup_error = Some(result.message.clone()); }
+                Some(result)
+            }
+            Err(error) => { setup_error = Some(error); None }
+        }
+    } else { None };
+    let mut requirements = requirements;
+    if let Some(report) = &mut requirements { report.automatic_setup = true; }
     let workspace = Workspace {
         id: slug.clone(),
         name,
         branch: session_branch.to_owned(),
         base_branch,
-        status: "Ready".into(),
+        status: if setup_error.is_some() { "Setup failed" } else { "Ready" }.into(),
         path: format!("~/orvex/workspaces/{slug}"),
         repo_url,
         vm_name: Some(instance_name),
@@ -1795,7 +1812,44 @@ fi
         .map(|provider| install_workspace_agent_blocking(&home, workspace.vm_name.as_deref().unwrap(), &slug, provider))
         .collect();
     let setup_commands = project_config.setup_commands;
-    Ok(WorkspaceCreationResult { workspace, agent_installations, setup_commands, setup_error, requirements })
+    Ok(WorkspaceCreationResult { workspace, agent_installations, setup_commands, setup_error, setup_result, requirements })
+}
+
+fn provision_workspace_dependencies(
+    home: &Path,
+    instance: &str,
+    id: &str,
+    config: &ProjectConfig,
+    needs_docker: bool,
+) -> Result<ProjectSetupResult, String> {
+    if needs_docker { ensure_docker_blocking(home, instance)?; }
+    let mode = if config.setup_commands.is_empty() { "auto" } else { "custom" };
+    let bootstrap = format!(
+        "set -eu\ncd \"$HOME/orvex/workspaces/{id}\"\nexport PATH=\"/usr/local/bin:$HOME/.cargo/bin:$HOME/.dotnet:$PATH\"\nif ! command -v python3 >/dev/null; then sudo -n apt-get update; sudo -n apt-get install -y python3; fi\npython3 - {mode} <<'ORVEX_DEPENDENCIES'\n{}\nORVEX_DEPENDENCIES",
+        include_str!("../scripts/setup_dependencies.py")
+    );
+    let mut commands = vec![bootstrap];
+    commands.extend(config.setup_commands.iter().map(|command| format!(
+        "cd \"$HOME/orvex/workspaces/{id}\" && export PATH=\"/usr/local/bin:$HOME/.cargo/bin:$HOME/.dotnet:$PATH\" && sh -lc {}", shell_quote(command)
+    )));
+    let labels = std::iter::once("Install detected project dependencies".to_owned())
+        .chain(config.setup_commands.iter().cloned()).collect::<Vec<_>>();
+    for (completed, command) in commands.iter().enumerate() {
+        let output = run_limactl(home, &["shell", instance, "sh", "-lc", command])?;
+        if !output.status.success() {
+            return Ok(ProjectSetupResult { commands: labels.clone(), completed,
+                failed_command: Some(labels[completed].clone()),
+                message: output_error(&output, "install workspace dependencies") });
+        }
+    }
+    Ok(ProjectSetupResult { completed: labels.len(), commands: labels,
+        failed_command: None, message: "Project dependencies installed.".into() })
+}
+
+#[tauri::command]
+async fn get_mcp_status(app: AppHandle) -> Result<mcp_connections::Status, String> {
+    let directory=app.path().app_data_dir().map_err(|e|e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || mcp_connections::status(&directory)).await.map_err(|e|e.to_string())?
 }
 
 #[tauri::command]
@@ -2319,6 +2373,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
+            get_mcp_status,
             list_workspaces,
             create_workspace,
             run_workspace_setup,

@@ -48,6 +48,7 @@ pub(crate) fn tools() -> Value {
     let cmd = json!({"type":"array","minItems":1,"maxItems":1024,"items":{"type":"string"},"description":"Guest argv, e.g. [\"bash\",\"-lc\",\"npm run dev\"]. Runs in the VM checkout. Use this tool for ALL reads, edits, builds and Git operations on this workspace."});
     let item = json!({"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"kind":{"type":"string","enum":["runtime","tool","service","containerImage","configuration","externalConfiguration"]},"name":{"type":"string"},"version":{"type":["string","null"]},"enabled":{"type":"boolean"}},"required":["id","kind","name","enabled"]});
     let definitions = vec![
+        ("mcp_status", "List currently negotiated live Orvex MCP client sessions. This reports client self-identification and server-process liveness, not provider authentication or CLI installation.",json!({}),json!([]),true),
         (
             "environment_plan_create",
             "Inspect a committed project and create a persistent draft environment plan. Show the user the detected tools/services, proposed items and uncertainties. Let them add/edit/remove/disable items before asking for approval. This tool never installs or executes anything.",
@@ -99,7 +100,7 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "workspace_create",
-            "Create a dedicated VM and independent session branch from projectPath (host Git committed HEAD snapshot) or repoUrl (public HTTPS). Requires network=true after user approval. Host uncommitted edits are not included; projectPath supports local commits without copying host credentials. Detects requirements; rejects Apple-only projects unless allowUnsupportedPlatform=true. Installs no agent CLI and runs no project setup scripts.",
+            "Create a dedicated VM and independent session branch from projectPath (host Git committed HEAD snapshot) or repoUrl (public HTTPS). Requires network=true after user approval. Host uncommitted edits are not included; projectPath supports local commits without copying host credentials. Automatically installs detected project runtimes and dependencies and runs declared .orvex/workspace.json setup commands inside the guest. Check setupError and setupResult before reporting readiness. Rejects Apple-only projects unless allowUnsupportedPlatform=true. Installs no agent CLI.",
             json!({"name":{"type":"string"},"repoUrl":{"type":"string"},"projectPath":{"type":"string"},"branch":{"type":"string"},"allowUnsupportedPlatform":{"type":"boolean","default":false,"description":"Allow source-editing-only Linux workspace despite detected unsupported Apple platform requirements, after explaining the limitation to the user."},"network":net}),
             json!(["name", "network"]),
             false,
@@ -177,6 +178,7 @@ pub(crate) fn call(name: &str, args: &Value) -> Result<Value, String> {
     }
     let controller = controller()?;
     match name {
+        "mcp_status" => serde_json::to_value(crate::mcp_connections::status(&crate::cli_app_data_dir()?)?).map_err(|e|e.to_string()),
         "environment_plan_create" => {
             let inspection = call("project_inspect", args)?;
             let plan = crate::environment_plan::Store::new(&crate::cli_app_data_dir()?)
@@ -468,6 +470,7 @@ pub(crate) fn serve() -> Result<(), String> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     let mut initialized = false;
+    let mut connection: Option<crate::mcp_connections::Connection> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -483,7 +486,24 @@ pub(crate) fn serve() -> Result<(), String> {
             return Err("MCP request exceeds 1 MiB.".into());
         }
         let result = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => response(&request, &mut initialized),
+            Ok(request) => {
+                let result = response(&request, &mut initialized);
+                if request["method"] == "initialize"
+                    && result.as_ref().is_some_and(|r| r.get("result").is_some())
+                    && connection.is_none()
+                {
+                    match crate::cli_app_data_dir().and_then(|data| {
+                        crate::mcp_connections::Connection::register(
+                            &data,
+                            &request["params"]["clientInfo"],
+                        )
+                    }) {
+                        Ok(record) => connection = Some(record),
+                        Err(error) => eprintln!("MCP session presence unavailable: {error}"),
+                    }
+                }
+                result
+            }
             Err(_) => Some(
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}),
             ),
@@ -524,7 +544,7 @@ mod tests {
             &mut init,
         )
         .unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 15);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 16);
         assert_eq!(
             response(&json!({"jsonrpc":"2.0","id":3,"method":"bogus"}), &mut init).unwrap()["error"]
                 ["code"],

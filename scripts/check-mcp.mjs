@@ -47,7 +47,7 @@ let sessionId;
 try {
   await connection.hello();
   const tools = await connection.request('tools/list');
-  assert.equal(tools.result.tools.length, 15);
+  assert.equal(tools.result.tools.length, 16);
   assert((await connection.request('ping')).result);
   const denied = await connection.request('tools/call', { name: 'workspace_start', arguments: { workspaceId: 'nonexistent', network: false } });
   assert.equal(denied.result.isError, true);

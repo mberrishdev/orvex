@@ -12,11 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "Orvex · Workspaces",
+        "title": "Orvex \u00b7 Workspaces",
         "width": 1180,
         "height": 780,
         "minWidth": 760,
-        "minHeight": 620
+        "minHeight": 620,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "backgroundColor": "#F5F5F7"
       }
     ],
     "security": {
