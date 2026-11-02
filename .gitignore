@@ -1,6 +1,9 @@
 # Research and planning artifacts are local to this checkout.
 /research/
 /output/
+/docs/
+/ROADMAP.md
+/apps/desktop/README.md
 
 # JavaScript package managers and build output
 node_modules/
