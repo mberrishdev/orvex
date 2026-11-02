@@ -30,6 +30,123 @@ struct Workspace {
     // Missing on older records; those workspaces remain on the legacy shared VM.
     #[serde(default)]
     vm_name: Option<String>,
+    #[serde(default)]
+    agent_providers: Vec<String>,
+    #[serde(default)]
+    compose_file: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInstallResult {
+    provider_id: String,
+    provider_name: String,
+    installed: bool,
+    version: Option<String>,
+    message: String,
+    login_hint: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCreationResult {
+    workspace: Workspace,
+    agent_installations: Vec<AgentInstallResult>,
+    setup_commands: Vec<String>,
+    setup_error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceServices {
+    workspace_id: String,
+    compose_file: Option<String>,
+    docker_installed: bool,
+    vm_ip: Option<String>,
+    output: String,
+    containers: Vec<ComposeContainer>,
+    ports: Vec<WorkspacePort>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ComposePsLine {
+    service: String,
+    state: String,
+    #[serde(default)]
+    health: String,
+    #[serde(default)]
+    publishers: Option<Vec<ComposePublisher>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ComposePublisher {
+    #[serde(rename = "URL")]
+    url: String,
+    target_port: u16,
+    published_port: Option<u16>,
+    protocol: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComposeContainer {
+    service: String,
+    state: String,
+    health: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspacePort {
+    service: String,
+    target_port: u16,
+    published_port: u16,
+    protocol: String,
+    url: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ProjectSetupManifest {
+    version: u32,
+    #[serde(default)]
+    setup: ProjectSetup,
+    #[serde(default)]
+    services: Option<ProjectServices>,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ProjectSetup {
+    commands: Vec<String>,
+}
+
+impl Default for ProjectSetup {
+    fn default() -> Self {
+        Self { commands: Vec::new() }
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ProjectServices {
+    compose_file: Option<String>,
+}
+
+struct ProjectConfig {
+    setup_commands: Vec<String>,
+    compose_file: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSetupResult {
+    commands: Vec<String>,
+    completed: usize,
+    failed_command: Option<String>,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -58,6 +175,66 @@ struct VmProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
 }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentProvider {
+    id: &'static str,
+    name: &'static str,
+    executable: &'static str,
+    login_hint: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPreflight {
+    workspace_id: String,
+    provider_id: String,
+    provider_name: String,
+    installed: bool,
+    version: Option<String>,
+    message: String,
+    login_hint: String,
+}
+
+const AGENT_PROVIDERS: [AgentProvider; 6] = [
+    AgentProvider {
+        id: "codex",
+        name: "OpenAI Codex",
+        executable: "codex",
+        login_hint: "Run `codex login` in the guest terminal.",
+    },
+    AgentProvider {
+        id: "copilot",
+        name: "GitHub Copilot CLI",
+        executable: "copilot",
+        login_hint: "Run `copilot` in the guest terminal and follow its sign-in prompt.",
+    },
+    AgentProvider {
+        id: "claude",
+        name: "Claude Code",
+        executable: "claude",
+        login_hint: "Run `claude auth login` in the guest terminal.",
+    },
+    AgentProvider {
+        id: "pi",
+        name: "Pi Coding Agent",
+        executable: "pi",
+        login_hint: "Run `pi` in the guest terminal and configure a model provider.",
+    },
+    AgentProvider {
+        id: "cursor",
+        name: "Cursor Agent CLI",
+        executable: "agent",
+        login_hint: "Run `agent login` in the guest terminal.",
+    },
+    AgentProvider {
+        id: "gemini",
+        name: "Gemini CLI",
+        executable: "gemini",
+        login_hint: "Run `gemini` in the guest terminal and follow its sign-in setup.",
+    },
+];
 
 const POC_INSTANCE: &str = "orvex-poc";
 
@@ -677,6 +854,7 @@ fn start_instance_blocking(
                 "start",
                 &instance_arg,
                 "--vm-type=vz",
+                "--network=vzNAT",
                 "--mount-none",
                 "--containerd=none",
                 "--cpus=2",
@@ -771,11 +949,596 @@ fn workspace_record(app: &AppHandle, workspace_id: &str) -> Result<Workspace, St
         .ok_or_else(|| "That workspace is not in the Orvex workspace list.".to_owned())
 }
 
+fn agent_provider(provider_id: &str) -> Result<AgentProvider, String> {
+    AGENT_PROVIDERS
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .cloned()
+        .ok_or_else(|| format!("Unsupported coding agent: {provider_id}"))
+}
+
+fn install_workspace_agent_blocking(
+    home: &Path,
+    instance_name: &str,
+    workspace_id: &str,
+    provider: &AgentProvider,
+) -> AgentInstallResult {
+    let guest_path = format!("$HOME/orvex/workspaces/{workspace_id}");
+    let package = match provider.id {
+        "codex" => "@openai/codex",
+        "copilot" => "@github/copilot",
+        "claude" => "@anthropic-ai/claude-code",
+        "pi" => "@earendil-works/pi-coding-agent",
+        "gemini" => "@google/gemini-cli",
+        "cursor" => "",
+        _ => unreachable!("provider validated by the catalog"),
+    };
+    // Node 22 LTS is the common supported baseline for the selected npm CLIs.
+    // The official Node release index and checksum file are used to select and
+    // verify the current 22.x binary for the guest architecture.
+    let script = if provider.id == "cursor" {
+        format!(
+            r#"set -eu
+mkdir -p "$HOME/.local/bin"
+grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.profile"
+curl -fsSL https://cursor.com/install | bash
+"$HOME/.local/bin/agent" --version
+"#
+        )
+    } else {
+        format!(
+            r#"set -eu
+mkdir -p "$HOME/.local/bin" "$HOME/.local/lib"
+grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.profile"
+export PATH="$HOME/.local/bin:$PATH"
+arch="$(uname -m)"
+case "$arch" in
+  aarch64|arm64) node_arch=arm64 ;;
+  x86_64|amd64) node_arch=x64 ;;
+  *) echo "Unsupported guest architecture: $arch" >&2; exit 1 ;;
+esac
+if ! command -v node >/dev/null 2>&1 || ! node -e 'const [major,minor]=process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)' ; then
+  command -v curl >/dev/null 2>&1 || {{ sudo apt-get update && sudo apt-get install -y curl ca-certificates xz-utils python3; }}
+  version="$(curl -fsSL https://nodejs.org/dist/index.json | python3 -c 'import json,sys; print(next(x["version"] for x in json.load(sys.stdin) if x["version"].startswith("v22.")))')"
+  archive="node-$version-linux-$node_arch.tar.xz"
+  base="https://nodejs.org/dist/$version"
+  curl -fsSL "$base/$archive" -o "/tmp/$archive"
+  curl -fsSL "$base/SHASUMS256.txt" -o /tmp/node-shasums.txt
+  (cd /tmp && grep "  $archive$" node-shasums.txt | sha256sum -c -)
+  node_dir="$HOME/.local/lib/node-$version"
+  mkdir -p "$node_dir"
+  tar -xJf "/tmp/$archive" -C "$node_dir" --strip-components=1
+  ln -sf "$node_dir/bin/node" "$HOME/.local/bin/node"
+  ln -sf "$node_dir/bin/npm" "$HOME/.local/bin/npm"
+  ln -sf "$node_dir/bin/npx" "$HOME/.local/bin/npx"
+fi
+export NPM_CONFIG_PREFIX="$HOME/.local"
+npm install --global {package}
+cd "{guest_path}"
+"{executable}" --version
+"#,
+            executable = provider.executable,
+            guest_path = guest_path,
+            package = package,
+        )
+    };
+    let result = run_limactl(
+        home,
+        &["shell", instance_name, "sh", "-lc", &script],
+    );
+    match result {
+        Ok(output) if output.status.success() => {
+            let version_text = if output.stdout.is_empty() { &output.stderr } else { &output.stdout };
+            AgentInstallResult {
+                provider_id: provider.id.to_owned(),
+                provider_name: provider.name.to_owned(),
+                installed: true,
+                version: Some(String::from_utf8_lossy(version_text).trim().lines().last().unwrap_or("Installed").to_owned()),
+                message: "Installed in this workspace VM.".into(),
+                login_hint: provider.login_hint.to_owned(),
+            }
+        }
+        Ok(output) => AgentInstallResult {
+            provider_id: provider.id.to_owned(),
+            provider_name: provider.name.to_owned(),
+            installed: false,
+            version: None,
+            message: output_error(&output, &format!("install {}", provider.name)),
+            login_hint: provider.login_hint.to_owned(),
+        },
+        Err(error) => AgentInstallResult {
+            provider_id: provider.id.to_owned(),
+            provider_name: provider.name.to_owned(),
+            installed: false,
+            version: None,
+            message: error,
+            login_hint: provider.login_hint.to_owned(),
+        },
+    }
+}
+
+fn validate_setup_commands(commands: &[String]) -> Result<(), String> {
+    if commands.is_empty() || commands.len() > 10 {
+        return Err("The setup manifest must contain between 1 and 10 commands.".into());
+    }
+    if commands.iter().any(|command| {
+        let command = command.trim();
+        command.is_empty() || command.len() > 1_000 || command.contains('\0')
+    }) {
+        return Err("Each setup command must be non-empty and no longer than 1,000 bytes.".into());
+    }
+    Ok(())
+}
+
+fn validate_compose_path(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > 512
+        || value.contains(['\\', '\n', '\r', '\0'])
+        || path.is_absolute()
+        || path.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("Compose file must be a safe path relative to the repository root.".into());
+    }
+    Ok(())
+}
+
+fn detect_standard_compose_file(
+    home: &Path,
+    instance_name: &str,
+    workspace_id: &str,
+) -> Result<Option<String>, String> {
+    let script = format!(
+        "root=\"$HOME/orvex/workspaces/{workspace_id}\"; for file in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do if [ -f \"$root/$file\" ]; then printf '%s' \"$file\"; exit 0; fi; done; exit 44"
+    );
+    let output = run_limactl(home, &["shell", instance_name, "sh", "-lc", &script])?;
+    if output.status.code() == Some(44) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(output_error(&output, "look for a Docker Compose file"));
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+
+fn discover_project_config(
+    home: &Path,
+    instance_name: &str,
+    workspace_id: &str,
+) -> Result<ProjectConfig, String> {
+    let script = format!(
+        "file=\"$HOME/orvex/workspaces/{workspace_id}/.orvex/workspace.json\"; if [ -f \"$file\" ]; then cat -- \"$file\"; else exit 44; fi"
+    );
+    let output = run_limactl(home, &["shell", instance_name, "sh", "-lc", &script])?;
+    if output.status.code() == Some(44) {
+        return Ok(ProjectConfig {
+            setup_commands: Vec::new(),
+            compose_file: detect_standard_compose_file(home, instance_name, workspace_id)?,
+        });
+    }
+    if !output.status.success() {
+        return Err(output_error(&output, "read the project setup manifest"));
+    }
+    let manifest: ProjectSetupManifest = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Invalid .orvex/workspace.json: {error}"))?;
+    if manifest.version != 1 {
+        return Err(format!("Unsupported project setup manifest version {}.", manifest.version));
+    }
+    if !manifest.setup.commands.is_empty() {
+        validate_setup_commands(&manifest.setup.commands)
+            .map_err(|error| format!("Invalid .orvex/workspace.json: {error}"))?;
+    }
+    let configured_compose = manifest.services.and_then(|services| services.compose_file);
+    let compose_file = if let Some(path) = configured_compose {
+        validate_compose_path(&path)
+            .map_err(|error| format!("Invalid .orvex/workspace.json: {error}"))?;
+        let check = format!(
+            "test -f \"$HOME/orvex/workspaces/{workspace_id}/\"{}",
+            shell_quote(&path)
+        );
+        let check = run_limactl(home, &["shell", instance_name, "sh", "-lc", &check])?;
+        if !check.status.success() {
+            return Err(format!("The configured Compose file “{path}” was not found in the repository."));
+        }
+        Some(path)
+    } else {
+        detect_standard_compose_file(home, instance_name, workspace_id)?
+    };
+    Ok(ProjectConfig { setup_commands: manifest.setup.commands, compose_file })
+}
+
+fn run_workspace_setup_blocking(
+    app: &AppHandle,
+    workspace_id: &str,
+    approved_commands: Vec<String>,
+) -> Result<ProjectSetupResult, String> {
+    validate_setup_commands(&approved_commands)?;
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    let home = app_lima_home(app)?;
+    if vm_state(&home, instance_name)? != "running" {
+        return Err("Start this workspace's Linux VM before running project setup.".into());
+    }
+    let current_config = discover_project_config(&home, instance_name, &workspace.id)?;
+    if current_config.setup_commands != approved_commands {
+        return Err("The project setup manifest changed after review. Recreate the workspace to review its current commands.".into());
+    }
+    let guest_path = format!("$HOME/orvex/workspaces/{}", workspace.id);
+    let mut completed = 0;
+    for command in &approved_commands {
+        let script = format!("cd \"{guest_path}\" && sh -lc {}", shell_quote(command));
+        let output = run_limactl(
+            &home,
+            &["shell", instance_name, "sh", "-lc", &script],
+        )?;
+        if !output.status.success() {
+            let failed_command = command.clone();
+            let message = output_error(&output, "run a project setup command");
+            return Ok(ProjectSetupResult {
+                commands: approved_commands,
+                completed,
+                failed_command: Some(failed_command),
+                message,
+            });
+        }
+        completed += 1;
+    }
+    Ok(ProjectSetupResult {
+        commands: approved_commands,
+        completed,
+        failed_command: None,
+        message: "Project setup completed.".into(),
+    })
+}
+
+fn ensure_docker_blocking(home: &Path, instance_name: &str) -> Result<(), String> {
+    const INSTALL_DOCKER: &str = r#"set -eu
+if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+  sudo -n apt-get update
+  sudo -n apt-get install -y ca-certificates curl
+  sudo -n install -m 0755 -d /etc/apt/keyrings
+  sudo -n curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo -n chmod a+r /etc/apt/keyrings/docker.asc
+  arch="$(dpkg --print-architecture)"
+  suite="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' "$suite" "$arch" | sudo -n tee /etc/apt/sources.list.d/docker.sources >/dev/null
+  sudo -n apt-get update
+  sudo -n apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+fi
+sudo -n systemctl enable --now docker
+sudo -n usermod -aG docker "$(id -un)"
+docker compose version
+"#;
+    let output = run_limactl(home, &["shell", instance_name, "sh", "-lc", INSTALL_DOCKER])?;
+    if !output.status.success() {
+        return Err(output_error(&output, "install Docker Engine and Compose in the workspace VM"));
+    }
+    Ok(())
+}
+
+fn discover_workspace_vm_ip(home: &Path, instance_name: &str) -> Option<String> {
+    let output = run_limactl(
+        home,
+        &[
+            "shell",
+            instance_name,
+            "sh",
+            "-lc",
+            "ip -o -4 addr show scope global",
+        ],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            let index = words.iter().position(|word| *word == "inet")?;
+            words.get(index + 1).map(|address| address.split('/').next().unwrap_or_default())
+        })
+        .filter(|address| !address.is_empty() && *address != "192.168.5.15" && !address.starts_with("127."))
+        .last()
+        .map(str::to_owned)
+}
+
+fn workspace_compose_file(
+    app: &AppHandle,
+    home: &Path,
+    instance_name: &str,
+    workspace: &Workspace,
+) -> Result<Option<String>, String> {
+    let compose_file = match workspace.compose_file.as_deref() {
+        Some(path) => {
+            validate_compose_path(path)?;
+            Some(path.to_owned())
+        }
+        None => discover_project_config(home, instance_name, &workspace.id)?.compose_file,
+    };
+    if let Some(path) = &compose_file {
+        let check = format!(
+            "test -f \"$HOME/orvex/workspaces/{}/\"{}",
+            workspace.id,
+            shell_quote(path)
+        );
+        let output = run_limactl(home, &["shell", instance_name, "sh", "-lc", &check])?;
+        if !output.status.success() {
+            return Err(format!("Compose file “{path}” is missing from this workspace."));
+        }
+    }
+    if workspace.compose_file != compose_file {
+        let mut workspaces = read_workspaces(app)?;
+        if let Some(saved) = workspaces.iter_mut().find(|item| item.id == workspace.id) {
+            saved.compose_file = compose_file.clone();
+            write_workspaces(app, &workspaces)?;
+        }
+    }
+    Ok(compose_file)
+}
+
+fn compose_command(
+    action: &str,
+    workspace_id: &str,
+    compose_file: &str,
+) -> Result<String, String> {
+    validate_compose_path(compose_file)?;
+    let project = format!("orvex-{workspace_id}");
+    let command = match action {
+        "start" => "up -d --remove-orphans",
+        "stop" => "stop",
+        "status" => "ps --all --format json",
+        "logs" => "logs --tail 100 --no-color",
+        _ => return Err("Unsupported workspace service action.".into()),
+    };
+    Ok(format!(
+        "cd \"$HOME/orvex/workspaces/{workspace_id}\" && sudo -n docker compose --project-name {} --file {} {command}",
+        shell_quote(&project),
+        shell_quote(compose_file),
+    ))
+}
+
+fn manage_workspace_services_blocking(
+    app: &AppHandle,
+    workspace_id: &str,
+    action: &str,
+    allow_network: bool,
+) -> Result<WorkspaceServices, String> {
+    if action == "start" && !allow_network {
+        return Err("Approve network access before starting Compose services.".into());
+    }
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace.vm_name.as_deref().ok_or_else(|| {
+        "Services are available only in a dedicated workspace VM. This workspace uses the legacy shared VM.".to_owned()
+    })?;
+    let home = app_lima_home(app)?;
+    if vm_state(&home, instance_name)? != "running" {
+        return Err("Start this workspace's Linux VM before managing services.".into());
+    }
+    let compose_file = workspace_compose_file(app, &home, instance_name, &workspace)?
+        .ok_or_else(|| "No Compose file found. Add compose.yaml or declare services.composeFile in .orvex/workspace.json.".to_owned())?;
+    let mut docker_installed = run_limactl(
+        &home,
+        &["shell", instance_name, "sh", "-lc", "command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1"],
+    )
+    .map(|result| result.status.success())
+    .unwrap_or(false);
+    if action == "start" {
+        ensure_docker_blocking(&home, instance_name)?;
+        docker_installed = true;
+    } else if !docker_installed {
+        return Ok(WorkspaceServices {
+            workspace_id: workspace.id,
+            compose_file: Some(compose_file),
+            docker_installed: false,
+            vm_ip: discover_workspace_vm_ip(&home, instance_name),
+            output: "Docker Engine and Compose are not installed. Start services to install them.".into(),
+            containers: Vec::new(),
+            ports: Vec::new(),
+        });
+    }
+    let command = compose_command(action, &workspace.id, &compose_file)?;
+    let output = run_limactl(&home, &["shell", instance_name, "sh", "-lc", &command])?;
+    if !output.status.success() {
+        return Err(output_error(&output, &format!("{action} workspace services")));
+    }
+    let command_output = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let mut containers = Vec::new();
+    let mut ports = Vec::new();
+    if action == "status" || action == "start" || action == "stop" || action == "logs" {
+        let status_command = compose_command("status", &workspace.id, &compose_file)?;
+        let status = run_limactl(&home, &["shell", instance_name, "sh", "-lc", &status_command])?;
+        if !status.status.success() {
+            return Err(output_error(&status, "read workspace service status"));
+        }
+        let vm_ip = discover_workspace_vm_ip(&home, instance_name);
+        for line in String::from_utf8_lossy(&status.stdout).lines().filter(|line| !line.trim().is_empty()) {
+            let item: ComposePsLine = serde_json::from_str(line)
+                .map_err(|error| format!("Could not parse Compose service status: {error}"))?;
+            containers.push(ComposeContainer { service: item.service.clone(), state: item.state, health: item.health });
+            for publisher in item.publishers.unwrap_or_default() {
+                let Some(published_port) = publisher.published_port else { continue };
+                let host_reachable = publisher.url == "0.0.0.0" || publisher.url == "::" || vm_ip.as_deref() == Some(&publisher.url);
+                let likely_http = publisher.protocol == "tcp"
+                    && matches!(publisher.target_port, 80 | 443 | 3000 | 4000 | 4173 | 5000 | 5173 | 8000 | 8080 | 8081 | 8888 | 9000);
+                let url = (host_reachable && likely_http).then(|| {
+                    let scheme = if publisher.target_port == 443 { "https" } else { "http" };
+                    format!("{scheme}://{}:{published_port}", vm_ip.as_deref().unwrap_or("<workspace-vm-ip>"))
+                });
+                ports.push(WorkspacePort {
+                    service: item.service.clone(),
+                    target_port: publisher.target_port,
+                    published_port,
+                    protocol: publisher.protocol,
+                    url,
+                });
+            }
+        }
+    }
+    Ok(WorkspaceServices {
+        workspace_id: workspace.id,
+        compose_file: Some(compose_file),
+        docker_installed,
+        vm_ip: discover_workspace_vm_ip(&home, instance_name),
+        output: if action == "status" { String::new() } else { command_output },
+        containers,
+        ports,
+    })
+}
+
+fn check_workspace_agent_blocking(
+    app: &AppHandle,
+    workspace_id: &str,
+    provider_id: &str,
+) -> Result<AgentPreflight, String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let provider = agent_provider(provider_id)?;
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    let home = app_lima_home(app)?;
+    if vm_state(&home, instance_name)? != "running" {
+        return Err("Start this workspace's Linux VM before checking agent setup.".into());
+    }
+
+    let (_, guest_home, _) = guest_user(&home, instance_name)?;
+    let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
+    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let script = format!(
+        "export PATH=\"$HOME/.local/bin:$PATH\"; if command -v {0} >/dev/null 2>&1; then {0} --version; else exit 127; fi",
+        provider.executable
+    );
+    let output = run_limactl(
+        &home,
+        &[
+            "shell",
+            "--workdir",
+            &guest_path_text,
+            instance_name,
+            "sh",
+            "-lc",
+            &script,
+        ],
+    )?;
+    if !output.status.success() && output.status.code() != Some(127) {
+        return Err(output_error(&output, &format!("check {} in the guest", provider.name)));
+    }
+    let installed = output.status.success();
+    let version = installed.then(|| {
+        let version_text = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        String::from_utf8_lossy(version_text)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Version not reported")
+            .to_owned()
+    });
+    let message = if installed {
+        "CLI found in this workspace VM. Sign-in is managed inside the guest.".to_owned()
+    } else {
+        format!(
+            "{} was not found in this workspace VM. Install it inside the guest first.",
+            provider.name
+        )
+    };
+
+    Ok(AgentPreflight {
+        workspace_id: workspace.id,
+        provider_id: provider.id.to_owned(),
+        provider_name: provider.name.to_owned(),
+        installed,
+        version,
+        message,
+        login_hint: provider.login_hint.to_owned(),
+    })
+}
+
+fn open_workspace_agent_blocking(
+    app: &AppHandle,
+    workspace_id: &str,
+    provider_id: &str,
+    allow_network: bool,
+) -> Result<(), String> {
+    if !allow_network {
+        return Err("Approve network access before starting a cloud coding agent.".into());
+    }
+    let preflight = check_workspace_agent_blocking(app, workspace_id, provider_id)?;
+    if !preflight.installed {
+        return Err(preflight.message);
+    }
+    if !cfg!(target_os = "macos") {
+        return Err("Opening an agent terminal is currently supported on macOS only.".into());
+    }
+
+    let workspace = workspace_record(app, workspace_id)?;
+    let provider = agent_provider(provider_id)?;
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    let home = app_lima_home(app)?;
+    let (_, guest_home, _) = guest_user(&home, instance_name)?;
+    let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
+    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let limactl = find_executable("limactl")
+        .ok_or_else(|| "Lima is not installed. Install it before starting an agent.".to_owned())?;
+    let sessions = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?
+        .join("terminal-sessions");
+    std::fs::create_dir_all(&sessions)
+        .map_err(|error| format!("Could not prepare terminal session files: {error}"))?;
+    let script_path = sessions.join(format!("{}-agent-{}.command", workspace.id, provider.id));
+    let guest_command = format!(
+        "export PATH=\"$HOME/.local/bin:$PATH\"; exec {}",
+        shell_quote(provider.executable),
+    );
+    let script = format!(
+        "#!/bin/zsh\nexport LIMA_HOME={}\nexec {} shell --workdir {} {} sh -lc {}\n",
+        shell_quote(&home.to_string_lossy()),
+        shell_quote(&limactl.to_string_lossy()),
+        shell_quote(&guest_path_text),
+        shell_quote(instance_name),
+        shell_quote(&guest_command),
+    );
+    std::fs::write(&script_path, script)
+        .map_err(|error| format!("Could not prepare the agent command: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not secure the agent command: {error}"))?;
+    }
+    let output = Command::new("/usr/bin/open")
+        .args(["-a", "Terminal"])
+        .arg(&script_path)
+        .output()
+        .map_err(|error| format!("Could not open Terminal: {error}"))?;
+    if !output.status.success() {
+        return Err(output_error(&output, "open the agent terminal"));
+    }
+    Ok(())
+}
+
 fn workspace_vm_status_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
     let workspace = workspace_record(app, workspace_id)?;
     let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
     let home = app_lima_home(app)?;
     Ok(make_vm_status(vm_state(&home, instance_name)?, instance_name))
+}
+
+fn refresh_workspace_compose_file_blocking(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<Workspace, String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let Some(instance_name) = workspace.vm_name.as_deref() else { return Ok(workspace) };
+    let home = app_lima_home(app)?;
+    if vm_state(&home, instance_name)? != "running" {
+        return Ok(workspace);
+    }
+    let _ = workspace_compose_file(app, &home, instance_name, &workspace)?;
+    workspace_record(app, workspace_id)
 }
 
 fn start_workspace_vm_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
@@ -845,7 +1608,8 @@ fn create_workspace_blocking(
     name: String,
     repo_url: Option<String>,
     allow_network: bool,
-) -> Result<Workspace, String> {
+    agent_provider_ids: Vec<String>,
+) -> Result<WorkspaceCreationResult, String> {
     let name = name.trim().to_owned();
     let slug = workspace_slug(&name)?;
     let repo_url = repo_url
@@ -854,6 +1618,16 @@ fn create_workspace_blocking(
         .transpose()?;
     if !allow_network {
         return Err("Approve internet access to download Linux and create this workspace VM.".into());
+    }
+    if agent_provider_ids.is_empty() {
+        return Err("Choose at least one coding CLI to install in this workspace.".into());
+    }
+    let mut selected_providers = Vec::new();
+    for provider_id in agent_provider_ids {
+        let provider = agent_provider(&provider_id)?;
+        if !selected_providers.iter().any(|selected: &AgentProvider| selected.id == provider.id) {
+            selected_providers.push(provider);
+        }
     }
     let mut workspaces = read_workspaces(app)?;
     if workspaces.iter().any(|workspace| workspace.id == slug) {
@@ -900,6 +1674,10 @@ fi
         return Err(output_error(&output, "create the Linux workspace"));
     }
 
+    let (project_config, setup_error) = match discover_project_config(&home, &instance_name, &slug) {
+        Ok(config) => (config, None),
+        Err(error) => (ProjectConfig { setup_commands: Vec::new(), compose_file: None }, Some(error)),
+    };
     let workspace = Workspace {
         id: slug.clone(),
         name,
@@ -912,10 +1690,17 @@ fi
         path: format!("~/orvex/workspaces/{slug}"),
         repo_url,
         vm_name: Some(instance_name),
+        agent_providers: selected_providers.iter().map(|provider| provider.id.to_owned()).collect(),
+        compose_file: project_config.compose_file.clone(),
     };
     workspaces.push(workspace.clone());
     write_workspaces(app, &workspaces)?;
-    Ok(workspace)
+    let agent_installations = selected_providers
+        .iter()
+        .map(|provider| install_workspace_agent_blocking(&home, workspace.vm_name.as_deref().unwrap(), &slug, provider))
+        .collect();
+    let setup_commands = project_config.setup_commands;
+    Ok(WorkspaceCreationResult { workspace, agent_installations, setup_commands, setup_error })
 }
 
 #[tauri::command]
@@ -940,12 +1725,40 @@ async fn create_workspace(
     name: String,
     repo_url: Option<String>,
     allow_network: bool,
-) -> Result<Workspace, String> {
+    agent_provider_ids: Vec<String>,
+) -> Result<WorkspaceCreationResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        create_workspace_blocking(&app, name, repo_url, allow_network)
+        create_workspace_blocking(&app, name, repo_url, allow_network, agent_provider_ids)
     })
     .await
     .map_err(|error| format!("Workspace creation task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn run_workspace_setup(
+    app: AppHandle,
+    workspace_id: String,
+    approved_commands: Vec<String>,
+) -> Result<ProjectSetupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_workspace_setup_blocking(&app, &workspace_id, approved_commands)
+    })
+    .await
+    .map_err(|error| format!("Project setup task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn manage_workspace_services(
+    app: AppHandle,
+    workspace_id: String,
+    action: String,
+    allow_network: bool,
+) -> Result<WorkspaceServices, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        manage_workspace_services_blocking(&app, &workspace_id, &action, allow_network)
+    })
+    .await
+    .map_err(|error| format!("Workspace services task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -959,6 +1772,38 @@ async fn open_workspace_terminal(
     })
     .await
     .map_err(|error| format!("Terminal task failed: {error}"))?
+}
+
+#[tauri::command]
+fn list_agent_providers() -> Vec<AgentProvider> {
+    AGENT_PROVIDERS.to_vec()
+}
+
+#[tauri::command]
+async fn check_workspace_agent(
+    app: AppHandle,
+    workspace_id: String,
+    provider_id: String,
+) -> Result<AgentPreflight, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        check_workspace_agent_blocking(&app, &workspace_id, &provider_id)
+    })
+    .await
+    .map_err(|error| format!("Agent preflight task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn open_workspace_agent(
+    app: AppHandle,
+    workspace_id: String,
+    provider_id: String,
+    allow_network: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_workspace_agent_blocking(&app, &workspace_id, &provider_id, allow_network)
+    })
+    .await
+    .map_err(|error| format!("Agent launch task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -996,6 +1841,18 @@ async fn get_workspace_vm_status(
     })
     .await
     .map_err(|error| format!("Workspace VM status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn refresh_workspace_compose_file(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<Workspace, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        refresh_workspace_compose_file_blocking(&app, &workspace_id)
+    })
+    .await
+    .map_err(|error| format!("Compose discovery task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1077,11 +1934,17 @@ pub fn run() {
             get_app_info,
             list_workspaces,
             create_workspace,
+            run_workspace_setup,
+            manage_workspace_services,
             open_workspace_terminal,
+            list_agent_providers,
+            check_workspace_agent,
+            open_workspace_agent,
             get_lima_status,
             install_lima,
             get_vm_status,
             get_workspace_vm_status,
+            refresh_workspace_compose_file,
             start_workspace_vm,
             stop_workspace_vm,
             run_workspace_check,

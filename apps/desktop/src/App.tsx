@@ -1,13 +1,27 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type AppInfo = { name: string; version: string; platform: string };
-type Workspace = { id: string; name: string; branch: string; status: string; path: string; repoUrl: string | null; vmName: string | null };
+type Workspace = { id: string; name: string; branch: string; status: string; path: string; repoUrl: string | null; vmName: string | null; agentProviders: string[]; composeFile: string | null };
 type LimaStatus = { installed: boolean; version: string | null; installSupported: boolean; installer: string | null };
 type VmStatus = { state: "notCreated" | "running" | "stopped" | string; instanceName: string; imageBytes: number | null };
 type VmProgress = { phase: string; message: string; downloadedBytes?: number | null; workspaceId?: string };
+type AgentProvider = { id: string; name: string; executable: string; loginHint: string };
+type AgentInstallResult = { providerId: string; providerName: string; installed: boolean; version: string | null; message: string; loginHint: string };
+type WorkspaceCreationResult = { workspace: Workspace; agentInstallations: AgentInstallResult[]; setupCommands: string[]; setupError: string | null };
+type ProjectSetupResult = { commands: string[]; completed: number; failedCommand: string | null; message: string };
+type WorkspaceServices = {
+  workspaceId: string;
+  composeFile: string | null;
+  dockerInstalled: boolean;
+  vmIp: string | null;
+  output: string;
+  containers: { service: string; state: string; health: string }[];
+  ports: { service: string; targetPort: number; publishedPort: number; protocol: string; url: string | null }[];
+};
 
 const vmStages = [
   { phase: "checking", label: "Check" },
@@ -29,6 +43,13 @@ function App() {
   const [workspaceVmProgress, setWorkspaceVmProgress] = useState<Record<string, VmProgress>>({});
   const [workspaceVmAction, setWorkspaceVmAction] = useState<string | null>(null);
   const [workspaceVmError, setWorkspaceVmError] = useState<string | null>(null);
+  const [agentProviders, setAgentProviders] = useState<AgentProvider[]>([]);
+  const [agentProviderError, setAgentProviderError] = useState<string | null>(null);
+  const [workspaceAgentInstallations, setWorkspaceAgentInstallations] = useState<Record<string, AgentInstallResult[]>>({});
+  const [workspaceSetupResults, setWorkspaceSetupResults] = useState<Record<string, ProjectSetupResult>>({});
+  const [workspaceSetupErrors, setWorkspaceSetupErrors] = useState<Record<string, string>>({});
+  const [workspaceServices, setWorkspaceServices] = useState<Record<string, WorkspaceServices>>({});
+  const [workspaceServiceAction, setWorkspaceServiceAction] = useState<string | null>(null);
   const [lima, setLima] = useState<LimaStatus | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [vmAction, setVmAction] = useState<string | null>(null);
@@ -41,6 +62,7 @@ function App() {
   const [workspaceName, setWorkspaceName] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
   const [allowVmNetwork, setAllowVmNetwork] = useState(false);
+  const [selectedAgents, setSelectedAgents] = useState<string[]>([]);
   const [workspaceCreating, setWorkspaceCreating] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [terminalAction, setTerminalAction] = useState<string | null>(null);
@@ -70,8 +92,36 @@ function App() {
           }
         }));
         setWorkspaceVms(Object.fromEntries(statuses.filter((entry): entry is readonly [string, VmStatus] => entry[1] !== null)));
+        const runningWorkspaceIds = new Set(statuses.filter((entry): entry is readonly [string, VmStatus] => entry[1]?.state === "running").map(([id]) => id));
+        const discovered = await Promise.all(items.filter((workspace) => workspace.vmName && runningWorkspaceIds.has(workspace.id)).map(async (workspace) => {
+          try {
+            return await invoke<Workspace>("refresh_workspace_compose_file", { workspaceId: workspace.id });
+          } catch {
+            return null;
+          }
+        }));
+        const byId = new Map(discovered.filter((workspace): workspace is Workspace => workspace !== null).map((workspace) => [workspace.id, workspace]));
+        if (byId.size > 0) setWorkspaces((current) => current.map((workspace) => byId.get(workspace.id) ?? workspace));
+        const serviceStates = await Promise.all([...byId.values()].filter((workspace) => workspace.composeFile).map(async (workspace) => {
+          try {
+            return [workspace.id, await invoke<WorkspaceServices>("manage_workspace_services", {
+              workspaceId: workspace.id,
+              action: "status",
+              allowNetwork: false,
+            })] as const;
+          } catch {
+            return null;
+          }
+        }));
+        setWorkspaceServices(Object.fromEntries(serviceStates.filter((entry): entry is readonly [string, WorkspaceServices] => entry !== null)));
       })
       .catch((reason: unknown) => setError(String(reason)));
+  }, []);
+
+  useEffect(() => {
+    invoke<AgentProvider[]>("list_agent_providers")
+      .then(setAgentProviders)
+      .catch((reason: unknown) => setAgentProviderError(String(reason)));
   }, []);
 
   useEffect(() => {
@@ -135,6 +185,7 @@ function App() {
     setWorkspaceName("");
     setRepoUrl("");
     setAllowVmNetwork(false);
+    setSelectedAgents([]);
     setWorkspaceError(null);
     setWorkspaceDialogOpen(true);
   }
@@ -147,19 +198,61 @@ function App() {
     setWorkspaceCreating(true);
     setWorkspaceError(null);
     try {
-      const workspace = await invoke<Workspace>("create_workspace", {
+      const result = await invoke<WorkspaceCreationResult>("create_workspace", {
         name: workspaceName,
         repoUrl: repoUrl.trim() || null,
         allowNetwork: allowVmNetwork,
+        agentProviderIds: selectedAgents,
       });
+      const { workspace } = result;
       setWorkspaces((current) => [workspace, ...current]);
+      setWorkspaceAgentInstallations((current) => ({ ...current, [workspace.id]: result.agentInstallations }));
+      if (result.setupError) setWorkspaceSetupErrors((current) => ({ ...current, [workspace.id]: result.setupError as string }));
       const workspaceVm: VmStatus = { state: "running", instanceName: workspace.vmName ?? "", imageBytes: null };
       setWorkspaceVms((current) => ({ ...current, [workspace.id]: workspaceVm }));
+      if (workspace.composeFile) {
+        try {
+          const serviceState = await invoke<WorkspaceServices>("manage_workspace_services", {
+            workspaceId: workspace.id,
+            action: "status",
+            allowNetwork: false,
+          });
+          setWorkspaceServices((current) => ({ ...current, [workspace.id]: serviceState }));
+        } catch {
+          // The workspace can still be used if service discovery is unavailable.
+        }
+      }
       setWorkspaceDialogOpen(false);
       setWorkspaceName("");
       setRepoUrl("");
       setAllowVmNetwork(false);
+      setSelectedAgents([]);
       setWorkspaceVmProgress((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      if (result.setupCommands.length > 0) {
+        const approved = window.confirm(
+          `This repository declares setup commands in .orvex/workspace.json:\n\n${result.setupCommands.map((command, index) => `${index + 1}. ${command}`).join("\n")}\n\nRun these commands inside the workspace VM?`,
+        );
+        if (approved) {
+          setWorkspaceSetupResults((current) => ({
+            ...current,
+            [workspace.id]: { commands: result.setupCommands, completed: 0, failedCommand: null, message: "Running project setup commands…" },
+          }));
+          try {
+            const setupResult = await invoke<ProjectSetupResult>("run_workspace_setup", {
+              workspaceId: workspace.id,
+              approvedCommands: result.setupCommands,
+            });
+            setWorkspaceSetupResults((current) => ({ ...current, [workspace.id]: setupResult }));
+          } catch (reason) {
+            setWorkspaceSetupErrors((current) => ({ ...current, [workspace.id]: String(reason) }));
+          }
+        } else {
+          setWorkspaceSetupResults((current) => ({
+            ...current,
+            [workspace.id]: { commands: result.setupCommands, completed: 0, failedCommand: null, message: "Setup skipped. Run these commands manually from the workspace terminal." },
+          }));
+        }
+      }
     } catch (reason) {
       setWorkspaceError(String(reason));
     } finally {
@@ -174,6 +267,22 @@ function App() {
     try {
       const status = await invoke<VmStatus>(action === "start" ? "start_workspace_vm" : "stop_workspace_vm", { workspaceId: workspace.id });
       setWorkspaceVms((current) => ({ ...current, [workspace.id]: status }));
+      if (action === "start") {
+        try {
+          const updatedWorkspace = await invoke<Workspace>("refresh_workspace_compose_file", { workspaceId: workspace.id });
+          setWorkspaces((current) => current.map((item) => item.id === workspace.id ? updatedWorkspace : item));
+          if (updatedWorkspace.composeFile) {
+            const services = await invoke<WorkspaceServices>("manage_workspace_services", {
+              workspaceId: workspace.id,
+              action: "status",
+              allowNetwork: false,
+            });
+            setWorkspaceServices((current) => ({ ...current, [workspace.id]: services }));
+          }
+        } catch {
+          // Keep the workspace VM available even if service status can't be refreshed.
+        }
+      }
     } catch (reason) {
       setWorkspaceVmError(`${workspace.name}: ${String(reason)}`);
     } finally {
@@ -208,6 +317,32 @@ function App() {
       setTerminalError(`${workspace.name}: ${String(reason)}`);
     } finally {
       setTerminalAction(null);
+    }
+  }
+
+  async function runWorkspaceServices(workspace: Workspace, action: "start" | "stop" | "status" | "logs") {
+    if (action === "start" && !window.confirm(
+      `Install Docker in “${workspace.name}” if needed, then start ${workspace.composeFile ?? "the Compose services"}?\n\nThis may download images and run project containers with the VM's current internet access. The Docker daemon has elevated access inside this workspace VM. Services are reachable from this Mac at the workspace VM address.`,
+    )) return;
+    const key = `${workspace.id}:${action}`;
+    setWorkspaceServiceAction(key);
+    try {
+      const result = await invoke<WorkspaceServices>("manage_workspace_services", {
+        workspaceId: workspace.id,
+        action,
+        allowNetwork: action === "start",
+      });
+      setWorkspaceServices((current) => ({ ...current, [workspace.id]: result }));
+    } catch (reason) {
+      setWorkspaceServices((current) => ({
+        ...current,
+        [workspace.id]: {
+          ...(current[workspace.id] ?? { workspaceId: workspace.id, composeFile: workspace.composeFile, dockerInstalled: false, vmIp: null, containers: [], ports: [] }),
+          output: String(reason),
+        },
+      }));
+    } finally {
+      setWorkspaceServiceAction(null);
     }
   }
 
@@ -347,6 +482,35 @@ function App() {
             {!isLegacy && workspaceVmAction === `${w.id}:start` && <small className="runtime-feedback">{workspaceVmProgress[w.id]?.message ?? "Starting this workspace's VM…"}</small>}
             <div className="workspace-terminal-actions"><button className="secondary-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div>
           </div>
+          {!isLegacy && w.composeFile && <section className="workspace-services" aria-label={`Services for ${w.name}`}>
+            <div className="workspace-services-heading"><strong>Docker Compose</strong><small>{w.composeFile}</small></div>
+            <div className="workspace-services-actions">
+              <button className="primary-button" disabled={state !== "running" || workspaceServiceAction !== null} onClick={() => void runWorkspaceServices(w, "start")}>
+                {workspaceServiceAction === `${w.id}:start` ? <><span className="spinner"/> Installing / starting…</> : workspaceServices[w.id]?.dockerInstalled ? "Start services" : "Install Docker & start"}
+              </button>
+              <button className="secondary-button" disabled={state !== "running" || workspaceServiceAction !== null || !workspaceServices[w.id]?.dockerInstalled} onClick={() => void runWorkspaceServices(w, "stop")}>{workspaceServiceAction === `${w.id}:stop` ? "Stopping…" : "Stop services"}</button>
+              <button className="secondary-button" disabled={state !== "running" || workspaceServiceAction !== null || !workspaceServices[w.id]?.dockerInstalled} onClick={() => void runWorkspaceServices(w, "status")}>{workspaceServiceAction === `${w.id}:status` ? "Refreshing…" : "Refresh"}</button>
+              <button className="secondary-button" disabled={state !== "running" || workspaceServiceAction !== null || !workspaceServices[w.id]?.dockerInstalled} onClick={() => void runWorkspaceServices(w, "logs")}>{workspaceServiceAction === `${w.id}:logs` ? "Loading logs…" : "View logs"}</button>
+            </div>
+            {workspaceServices[w.id]?.containers.map((container) => <div className="workspace-service-row" key={container.service}>
+              <b>{container.service}</b><span>{container.state}{container.health ? ` · ${container.health}` : ""}</span>
+            </div>)}
+            {workspaceServices[w.id]?.ports.map((port) => <div className="workspace-service-port" key={`${port.service}:${port.targetPort}:${port.publishedPort}`}>
+              <span>{port.service} · {port.publishedPort} → {port.targetPort}/{port.protocol}</span>
+              {port.url ? <button className="service-port-link" onClick={() => void openUrl(port.url as string)}>Open {port.url}</button> : workspaceServices[w.id]?.vmIp ? <code>{workspaceServices[w.id]?.vmIp}:{port.publishedPort}/{port.protocol}</code> : <small>Guest port {port.publishedPort}/{port.protocol}</small>}
+            </div>)}
+            {workspaceServices[w.id]?.output && <pre className="workspace-service-output">{workspaceServices[w.id]?.output}</pre>}
+            {workspaceServices[w.id]?.vmIp && <small className="workspace-service-hint">VM address: {workspaceServices[w.id]?.vmIp} · reachable from this Mac only</small>}
+          </section>}
+          {!isLegacy && workspaceAgentInstallations[w.id]?.length > 0 && <div className="workspace-cli-results" aria-label={`CLI installation results for ${w.name}`}>
+            {workspaceAgentInstallations[w.id].map((item) => <span className={item.installed ? "workspace-cli-installed" : "workspace-cli-failed"} key={item.providerId} title={item.message}>
+              {item.installed ? "✓" : "!"} {item.providerName}{item.version ? ` · ${item.version}` : ""}
+            </span>)}
+          </div>}
+          {workspaceSetupResults[w.id] && <small className={`workspace-setup-result ${workspaceSetupResults[w.id].failedCommand ? "workspace-setup-failed" : ""}`}>
+            {workspaceSetupResults[w.id].message}{workspaceSetupResults[w.id].failedCommand ? ` · Failed: ${workspaceSetupResults[w.id].failedCommand}` : ""}
+          </small>}
+          {workspaceSetupErrors[w.id] && <small className="workspace-setup-result workspace-setup-failed">Setup config: {workspaceSetupErrors[w.id]}</small>}
         </article>;
       })}</div>}
       <footer className="footer"><span>Local-first by design</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
@@ -355,11 +519,20 @@ function App() {
       <form className="workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" onSubmit={(event) => { event.preventDefault(); void createWorkspace(); }}>
         <div className="eyebrow">NEW WORKSPACE</div>
         <h2 id="workspace-dialog-title">Create a workspace VM</h2>
-        <p>Orvex creates a separate Linux VM for this workspace and stores its files inside that VM. First creation downloads the Ubuntu image. You can optionally clone a public HTTPS repository.</p>
+        <p>Orvex creates a separate Linux VM, clones your project, and installs the coding CLIs you select. It can also detect a Compose file for services. Setup commands and service startup require your approval.</p>
         <label htmlFor="workspace-name">Workspace name</label>
         <input id="workspace-name" autoFocus maxLength={64} value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="e.g. api-refactor" />
         <label htmlFor="repository-url">Public HTTPS Git URL <span>(optional)</span></label>
         <input id="repository-url" type="url" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/org/repository.git" />
+        <label>Coding CLIs to install <span>(choose one or more)</span></label>
+        <div className="agent-install-options">
+          {agentProviders.map((provider) => <label key={provider.id} className="agent-install-option">
+            <input type="checkbox" checked={selectedAgents.includes(provider.id)} onChange={(event) => setSelectedAgents((current) => event.target.checked ? [...current, provider.id] : current.filter((id) => id !== provider.id))} />
+            <span>{provider.name}</span>
+          </label>)}
+        </div>
+        {agentProviderError && <div className="vm-error" role="alert">Could not load coding CLI options: {agentProviderError}</div>}
+        <div className="workspace-dialog-note">Selected tools are installed inside this VM only. Their account sign-in remains yours to complete.</div>
         <label className="network-approval"><input type="checkbox" checked={allowVmNetwork} onChange={(event) => setAllowVmNetwork(event.target.checked)} />
           I approve downloading Linux and giving this workspace VM internet access{repoUrl.trim() ? ", including cloning this repository" : ""}.
         </label>
@@ -368,8 +541,8 @@ function App() {
         {workspaceError && <div className="vm-error" role="alert">{workspaceError}</div>}
         <div className="vm-actions workspace-dialog-actions">
           <button type="button" className="secondary-button" disabled={workspaceCreating} onClick={() => setWorkspaceDialogOpen(false)}>Cancel</button>
-          <button type="submit" className="primary-button" disabled={workspaceCreating || !lima?.installed || !workspaceName.trim() || !allowVmNetwork}>
-            {workspaceCreating ? <><span className="spinner"/> {repoUrl.trim() ? "Provisioning and cloning…" : "Provisioning VM…"}</> : "Create workspace"}
+          <button type="submit" className="primary-button" disabled={workspaceCreating || !lima?.installed || !workspaceName.trim() || !allowVmNetwork || selectedAgents.length === 0}>
+            {workspaceCreating ? <><span className="spinner"/> {repoUrl.trim() ? "Provisioning, cloning & installing…" : "Provisioning & installing…"}</> : "Create workspace"}
           </button>
         </div>
       </form>
