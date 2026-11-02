@@ -23,3 +23,17 @@
 .workspace-cli-results { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; border-top: 1px solid #243448; padding-top: 9px; }.workspace-cli-results span { border: 1px solid #2a3c50; border-radius: 99px; padding: 4px 8px; color: #9aacc0; background: #0c1521; font-size: 9px; }.workspace-cli-results .workspace-cli-installed { color: #8ce1bd; border-color: #315946; }.workspace-cli-results .workspace-cli-failed { color: #f0c77f; border-color: #5a482d; }
 .workspace-setup-result { grid-column: 1 / -1; color: #8ce1bd; font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }.workspace-setup-failed { color: #f0c77f; }
 .workspace-services { grid-column: 1 / -1; border-top: 1px solid #243448; padding-top: 10px; }.workspace-services-heading { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }.workspace-services-heading strong { color: #d9e4f1; font-size: 10px; }.workspace-services-heading small,.workspace-service-hint { color: #8294aa; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }.workspace-services-actions { display: flex; flex-wrap: wrap; gap: 6px; }.workspace-service-row,.workspace-service-port { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: #a9b8ca; font-size: 9px; margin-top: 7px; }.workspace-service-row b { color: #cbd7e5; font-weight: 600; }.service-port-link { border: 0; padding: 0; color: #86c9ff; background: transparent; font: inherit; font-size: 9px; cursor: pointer; }.workspace-service-port small { color: #8497ad; }.workspace-service-output { max-height: 160px; overflow: auto; margin: 8px 0 0; padding: 8px; border: 1px solid #293a4e; border-radius: 6px; background: #0a121d; color: #a9bad0; white-space: pre-wrap; overflow-wrap: anywhere; font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }.workspace-service-hint { display: block; margin-top: 7px; }
+.workspace-agent-readiness { grid-column: 1 / -1; border-top: 1px solid #243448; padding-top: 10px; }
+.workspace-agent-readiness-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.workspace-agent-readiness-heading strong { color: #d9e4f1; font-size: 10px; }
+.workspace-agent-readiness-heading small,.workspace-agent-readiness-row small { color: #8294aa; font-size: 9px; line-height: 1.5; }
+.workspace-agent-readiness-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; }
+.workspace-agent-readiness-row > div { min-width: 0; display: grid; gap: 3px; }
+.workspace-agent-readiness-row b { color: #cbd7e5; font-size: 10px; }
+.workspace-agent-readiness-row small { overflow-wrap: anywhere; }
+.workspace-agent-ready { color: #8ce1bd !important; }
+.workspace-agent-not-ready { color: #f0c77f !important; }
+
+.workspace-delete-dialog { color: #e9f0f8; max-height: calc(100vh - 48px); overflow: auto; }
+.workspace-delete-dialog::backdrop { background: rgba(3, 8, 14, .72); backdrop-filter: blur(4px); }
+.workspace-delete-dialog h2 { overflow-wrap: anywhere; }

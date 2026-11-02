@@ -7,6 +7,9 @@
     "dev": "pnpm --filter @orvex/desktop tauri dev",
     "build": "pnpm --filter @orvex/desktop build",
     "check:rust": "cargo check --workspace",
-    "tauri": "pnpm --filter @orvex/desktop tauri"
+    "orvex": "cargo run --package orvex-desktop --bin orvex",
+    "tauri": "pnpm --filter @orvex/desktop tauri",
+    "install:cli": "node scripts/install-cli.mjs",
+    "check:mcp": "node scripts/check-mcp.mjs"
   }
 }

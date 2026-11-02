@@ -1,16 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type AppInfo = { name: string; version: string; platform: string };
-type Workspace = { id: string; name: string; branch: string; status: string; path: string; repoUrl: string | null; vmName: string | null; agentProviders: string[]; composeFile: string | null };
+type Workspace = { id: string; name: string; branch: string; baseBranch: string | null; status: string; path: string; repoUrl: string | null; vmName: string | null; agentProviders: string[]; composeFile: string | null };
 type LimaStatus = { installed: boolean; version: string | null; installSupported: boolean; installer: string | null };
 type VmStatus = { state: "notCreated" | "running" | "stopped" | string; instanceName: string; imageBytes: number | null };
 type VmProgress = { phase: string; message: string; downloadedBytes?: number | null; workspaceId?: string };
 type AgentProvider = { id: string; name: string; executable: string; loginHint: string };
 type AgentInstallResult = { providerId: string; providerName: string; installed: boolean; version: string | null; message: string; loginHint: string };
+type AgentPreflight = { workspaceId: string; providerId: string; providerName: string; installed: boolean; version: string | null; message: string; loginHint: string };
 type WorkspaceCreationResult = { workspace: Workspace; agentInstallations: AgentInstallResult[]; setupCommands: string[]; setupError: string | null };
 type ProjectSetupResult = { commands: string[]; completed: number; failedCommand: string | null; message: string };
 type WorkspaceServices = {
@@ -42,10 +43,22 @@ function App() {
   const [workspaceVms, setWorkspaceVms] = useState<Record<string, VmStatus>>({});
   const [workspaceVmProgress, setWorkspaceVmProgress] = useState<Record<string, VmProgress>>({});
   const [workspaceVmAction, setWorkspaceVmAction] = useState<string | null>(null);
+  const [workspaceDeleting, setWorkspaceDeleting] = useState<string | null>(null);
+  const [pendingWorkspaceDelete, setPendingWorkspaceDelete] = useState<Workspace | null>(null);
+  const deleteDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = deleteDialogRef.current;
+    if (!dialog) return;
+    if (pendingWorkspaceDelete && !dialog.open) dialog.showModal();
+    else if (!pendingWorkspaceDelete && dialog.open) dialog.close();
+  }, [pendingWorkspaceDelete]);
   const [workspaceVmError, setWorkspaceVmError] = useState<string | null>(null);
   const [agentProviders, setAgentProviders] = useState<AgentProvider[]>([]);
   const [agentProviderError, setAgentProviderError] = useState<string | null>(null);
   const [workspaceAgentInstallations, setWorkspaceAgentInstallations] = useState<Record<string, AgentInstallResult[]>>({});
+  const [workspaceAgentPreflights, setWorkspaceAgentPreflights] = useState<Record<string, AgentPreflight>>({});
+  const [agentPreflightAction, setAgentPreflightAction] = useState<string | null>(null);
   const [workspaceSetupResults, setWorkspaceSetupResults] = useState<Record<string, ProjectSetupResult>>({});
   const [workspaceSetupErrors, setWorkspaceSetupErrors] = useState<Record<string, string>>({});
   const [workspaceServices, setWorkspaceServices] = useState<Record<string, WorkspaceServices>>({});
@@ -61,6 +74,7 @@ function App() {
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
+  const [baseBranch, setBaseBranch] = useState("");
   const [allowVmNetwork, setAllowVmNetwork] = useState(false);
   const [selectedAgents, setSelectedAgents] = useState<string[]>([]);
   const [workspaceCreating, setWorkspaceCreating] = useState(false);
@@ -184,6 +198,7 @@ function App() {
   function openWorkspaceDialog() {
     setWorkspaceName("");
     setRepoUrl("");
+    setBaseBranch("");
     setAllowVmNetwork(false);
     setSelectedAgents([]);
     setWorkspaceError(null);
@@ -201,6 +216,7 @@ function App() {
       const result = await invoke<WorkspaceCreationResult>("create_workspace", {
         name: workspaceName,
         repoUrl: repoUrl.trim() || null,
+        baseBranch: baseBranch.trim() || null,
         allowNetwork: allowVmNetwork,
         agentProviderIds: selectedAgents,
       });
@@ -225,6 +241,7 @@ function App() {
       setWorkspaceDialogOpen(false);
       setWorkspaceName("");
       setRepoUrl("");
+      setBaseBranch("");
       setAllowVmNetwork(false);
       setSelectedAgents([]);
       setWorkspaceVmProgress((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
@@ -291,17 +308,33 @@ function App() {
   }
 
   async function deleteWorkspace(workspace: Workspace) {
-    if (!window.confirm(`Delete “${workspace.name}” and permanently remove its dedicated VM and files?`)) return;
-    setWorkspaceVmAction(`${workspace.id}:delete`);
+    const isLegacy = !workspace.vmName;
+    if (workspaceDeleting !== null) return;
+    setWorkspaceDeleting(workspace.id);
     setWorkspaceVmError(null);
     try {
       await invoke("delete_workspace", { workspaceId: workspace.id });
+      setPendingWorkspaceDelete(null);
       setWorkspaces((current) => current.filter((item) => item.id !== workspace.id));
       setWorkspaceVms((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      setWorkspaceVmProgress((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      setWorkspaceServices((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      setWorkspaceAgentInstallations((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      setWorkspaceAgentPreflights((current) => Object.fromEntries(
+        Object.entries(current).filter(([key]) => !key.startsWith(`${workspace.id}:`)),
+      ));
+      setWorkspaceSetupResults((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      setWorkspaceSetupErrors((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+      if (isLegacy) {
+        setVm({ state: "notCreated", instanceName: "orvex-poc", imageBytes: null });
+        setVmProgress(null);
+        setVmOutput(null);
+        setVmError(null);
+      }
     } catch (reason) {
       setWorkspaceVmError(`${workspace.name}: ${String(reason)}`);
     } finally {
-      setWorkspaceVmAction(null);
+      setWorkspaceDeleting(null);
     }
   }
 
@@ -343,6 +376,34 @@ function App() {
       }));
     } finally {
       setWorkspaceServiceAction(null);
+    }
+  }
+
+  async function checkWorkspaceAgent(workspace: Workspace, providerId: string) {
+    const key = `${workspace.id}:${providerId}`;
+    setAgentPreflightAction(key);
+    try {
+      const result = await invoke<AgentPreflight>("check_workspace_agent", {
+        workspaceId: workspace.id,
+        providerId,
+      });
+      setWorkspaceAgentPreflights((current) => ({ ...current, [key]: result }));
+    } catch (reason) {
+      const provider = agentProviders.find((item) => item.id === providerId);
+      setWorkspaceAgentPreflights((current) => ({
+        ...current,
+        [key]: {
+          workspaceId: workspace.id,
+          providerId,
+          providerName: provider?.name ?? providerId,
+          installed: false,
+          version: null,
+          message: String(reason),
+          loginHint: provider?.loginHint ?? "",
+        },
+      }));
+    } finally {
+      setAgentPreflightAction(null);
     }
   }
 
@@ -393,6 +454,7 @@ function App() {
   const downloadLabel = vmProgress?.downloadedBytes == null
     ? "First startup downloads and prepares Ubuntu; it can take a few minutes."
     : `${Math.floor(vmProgress.downloadedBytes / 1024).toLocaleString()} KB downloaded · Lima does not report the total image size.`;
+  const legacyWorkspaceCount = workspaces.filter((workspace) => !workspace.vmName).length;
 
   async function deleteVm() {
     if (window.confirm("Delete the legacy shared VM and permanently erase all older workspaces stored on it? This cannot be undone.")) {
@@ -470,18 +532,44 @@ function App() {
         const isLegacy = !w.vmName;
         const vmActionBusy = workspaceVmAction?.startsWith(`${w.id}:`) ?? false;
         return <article className="workspace-card" key={w.id}>
-          <div className="workspace-details"><b>{w.name}</b><p>{w.branch}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}
+          <div className="workspace-details"><b>{w.name}</b><p>{w.branch}{w.baseBranch ? ` · from ${w.baseBranch}` : ""}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}
             <span className={`runtime-badge ${state === "running" ? "ready" : "needs-setup"}`}>{isLegacy ? "SHARED LEGACY VM" : `WORKSPACE VM · ${state.toUpperCase()}`}</span>
           </div>
           <div className="workspace-controls"><span className="status">{w.status}</span>
-            {!isLegacy && <div className="workspace-terminal-actions">
-              {state !== "running" && <button className="primary-button" disabled={!lima?.installed || vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "start")}>{workspaceVmAction === `${w.id}:start` ? <><span className="spinner"/> Starting…</> : state === "stopped" ? "Resume VM" : "Start VM"}</button>}
-              {state === "running" && <button className="secondary-button" disabled={vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "stop")}>{workspaceVmAction === `${w.id}:stop` ? "Stopping…" : "Stop VM"}</button>}
-              <button className="danger-button" disabled={vmActionBusy || workspaceVmAction !== null} onClick={() => void deleteWorkspace(w)}>{workspaceVmAction === `${w.id}:delete` ? "Deleting…" : "Delete workspace"}</button>
-            </div>}
+            <div className="workspace-terminal-actions">
+              {!isLegacy && state !== "running" && <button className="primary-button" disabled={!lima?.installed || vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "start")}>{workspaceVmAction === `${w.id}:start` ? <><span className="spinner"/> Starting…</> : state === "stopped" ? "Resume VM" : "Start VM"}</button>}
+              {!isLegacy && state === "running" && <button className="secondary-button" disabled={vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "stop")}>{workspaceVmAction === `${w.id}:stop` ? "Stopping…" : "Stop VM"}</button>}
+              {(!isLegacy || legacyWorkspaceCount === 1)
+                ? <button className="danger-button" disabled={workspaceDeleting !== null || (isLegacy && vmAction !== null)} onClick={() => { setWorkspaceVmError(null); setPendingWorkspaceDelete(w); }}>{workspaceDeleting === w.id ? "Deleting…" : "Delete workspace"}</button>
+                : <button className="danger-button" disabled title="This workspace shares the legacy VM with other workspaces. Delete the shared VM to remove all legacy workspaces together.">Delete workspace</button>}
+            </div>
+            {isLegacy && legacyWorkspaceCount > 1 && <small className="runtime-feedback-error">This workspace shares a VM with {legacyWorkspaceCount - 1} others. Delete the shared VM to remove legacy workspaces together.</small>}
             {!isLegacy && workspaceVmAction === `${w.id}:start` && <small className="runtime-feedback">{workspaceVmProgress[w.id]?.message ?? "Starting this workspace's VM…"}</small>}
             <div className="workspace-terminal-actions"><button className="secondary-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div>
           </div>
+          {!isLegacy && w.agentProviders.length > 0 && <section className="workspace-agent-readiness" aria-label={`Coding CLI readiness for ${w.name}`}>
+            <div className="workspace-agent-readiness-heading">
+              <strong>Coding CLI readiness</strong>
+              <small>Checks installation and version only. Orvex will not start an agent here.</small>
+            </div>
+            {w.agentProviders.map((providerId) => {
+              const key = `${w.id}:${providerId}`;
+              const provider = agentProviders.find((item) => item.id === providerId);
+              const result = workspaceAgentPreflights[key];
+              return <div className="workspace-agent-readiness-row" key={providerId}>
+                <div>
+                  <b>{provider?.name ?? providerId}</b>
+                  {result && <small className={result.installed ? "workspace-agent-ready" : "workspace-agent-not-ready"}>
+                    {result.installed ? `Installed${result.version ? ` · ${result.version}` : ""}` : result.message}
+                  </small>}
+                  {result && <small>{result.installed ? `${result.loginHint} Authentication is not checked by Orvex.` : "After installation, authenticate from the workspace terminal. Authentication is not checked by Orvex."}</small>}
+                </div>
+                <button className="secondary-button" disabled={state !== "running" || agentPreflightAction !== null} onClick={() => void checkWorkspaceAgent(w, providerId)}>
+                  {agentPreflightAction === key ? "Checking…" : result ? "Check again" : "Check CLI"}
+                </button>
+              </div>;
+            })}
+          </section>}
           {!isLegacy && w.composeFile && <section className="workspace-services" aria-label={`Services for ${w.name}`}>
             <div className="workspace-services-heading"><strong>Docker Compose</strong><small>{w.composeFile}</small></div>
             <div className="workspace-services-actions">
@@ -515,15 +603,33 @@ function App() {
       })}</div>}
       <footer className="footer"><span>Local-first by design</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
+    <dialog ref={deleteDialogRef} className="workspace-dialog workspace-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-workspace-title" aria-describedby="delete-workspace-description" onCancel={(event) => { event.preventDefault(); if (workspaceDeleting === null) setPendingWorkspaceDelete(null); }}>
+      {pendingWorkspaceDelete && <>
+        <div className="eyebrow">DELETE WORKSPACE</div>
+        <h2 id="delete-workspace-title">Delete “{pendingWorkspaceDelete.name}”?</h2>
+        <p id="delete-workspace-description">This permanently deletes {pendingWorkspaceDelete.vmName ? "this workspace’s dedicated Linux VM" : "the legacy shared Linux VM"}, its repository, uncommitted changes, installed tools, sign-in data, containers, volumes, and session logs. This cannot be undone.</p>
+        <p>Your host project and remote repository are not deleted.</p>
+        {workspaceVmError && <div className="vm-error" role="alert">{workspaceVmError}</div>}
+        {workspaceDeleting !== null && <p role="status">Deleting the VM and workspace data…</p>}
+        <div className="vm-actions workspace-dialog-actions">
+          <button type="button" className="secondary-button" autoFocus disabled={workspaceDeleting !== null} onClick={() => setPendingWorkspaceDelete(null)}>Cancel</button>
+          <button type="button" className="danger-button" disabled={workspaceDeleting !== null} onClick={() => void deleteWorkspace(pendingWorkspaceDelete)}>{workspaceDeleting !== null ? "Deleting…" : "Delete permanently"}</button>
+        </div>
+      </>}
+    </dialog>
     {workspaceDialogOpen && <div className="modal-scrim">
       <form className="workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" onSubmit={(event) => { event.preventDefault(); void createWorkspace(); }}>
         <div className="eyebrow">NEW WORKSPACE</div>
         <h2 id="workspace-dialog-title">Create a workspace VM</h2>
-        <p>Orvex creates a separate Linux VM, clones your project, and installs the coding CLIs you select. It can also detect a Compose file for services. Setup commands and service startup require your approval.</p>
+        <p>Orvex creates a separate Linux VM and session branch, clones your project into it, and installs the coding CLIs you select. It can also detect a Compose file for services. Setup commands and service startup require your approval.</p>
         <label htmlFor="workspace-name">Workspace name</label>
         <input id="workspace-name" autoFocus maxLength={64} value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="e.g. api-refactor" />
         <label htmlFor="repository-url">Public HTTPS Git URL <span>(optional)</span></label>
         <input id="repository-url" type="url" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/org/repository.git" />
+        {repoUrl.trim() && <>
+          <label htmlFor="base-branch">Start from branch <span>(optional; remote default if blank)</span></label>
+          <input id="base-branch" value={baseBranch} onChange={(event) => setBaseBranch(event.target.value)} placeholder="main" />
+        </>}
         <label>Coding CLIs to install <span>(choose one or more)</span></label>
         <div className="agent-install-options">
           {agentProviders.map((provider) => <label key={provider.id} className="agent-install-option">

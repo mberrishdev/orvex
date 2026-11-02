@@ -1,3 +1,12 @@
+mod environment_plan;
+mod project_configuration;
+mod project_requirements;
+mod workspace_store;
+mod project_import;
+mod mcp;
+mod command_sessions;
+mod workspace_controller;
+
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
@@ -23,6 +32,8 @@ struct Workspace {
     id: String,
     name: String,
     branch: String,
+    #[serde(default)]
+    base_branch: Option<String>,
     status: String,
     path: String,
     #[serde(default)]
@@ -54,6 +65,7 @@ struct WorkspaceCreationResult {
     agent_installations: Vec<AgentInstallResult>,
     setup_commands: Vec<String>,
     setup_error: Option<String>,
+    requirements: Option<project_requirements::Requirements>,
 }
 
 #[derive(Clone, Serialize)]
@@ -245,11 +257,13 @@ fn find_executable(name: &str) -> Option<PathBuf> {
             PathBuf::from("/usr/local/bin/limactl"),
             PathBuf::from("/opt/local/bin/limactl"),
         ]
-    } else {
+    } else if name == "brew" {
         vec![
             PathBuf::from("/opt/homebrew/bin/brew"),
             PathBuf::from("/usr/local/bin/brew"),
         ]
+    } else {
+        vec![PathBuf::from("/opt/homebrew/bin").join(name), PathBuf::from("/usr/local/bin").join(name), PathBuf::from("/usr/bin").join(name)]
     };
     candidates
         .into_iter()
@@ -332,7 +346,12 @@ fn workspace_store_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn read_workspaces(app: &AppHandle) -> Result<Vec<Workspace>, String> {
-    let path = workspace_store_path(app)?;
+    let directory = app.path().app_data_dir()
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?;
+    workspace_controller::WorkspaceController::new(directory).list()
+}
+
+fn read_workspaces_at(path: &Path) -> Result<Vec<Workspace>, String> {
     match std::fs::read(&path) {
         Ok(data) => serde_json::from_slice(&data)
             .map_err(|error| format!("Could not read workspace list: {error}")),
@@ -342,7 +361,10 @@ fn read_workspaces(app: &AppHandle) -> Result<Vec<Workspace>, String> {
 }
 
 fn write_workspaces(app: &AppHandle, workspaces: &[Workspace]) -> Result<(), String> {
-    let path = workspace_store_path(app)?;
+    write_workspaces_at(&workspace_store_path(app)?, workspaces)
+}
+
+fn write_workspaces_at(path: &Path, workspaces: &[Workspace]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Could not locate Orvex app data directory.".to_owned())?;
@@ -350,7 +372,14 @@ fn write_workspaces(app: &AppHandle, workspaces: &[Workspace]) -> Result<(), Str
         .map_err(|error| format!("Could not prepare Orvex app data: {error}"))?;
     let data = serde_json::to_vec_pretty(workspaces)
         .map_err(|error| format!("Could not encode workspace list: {error}"))?;
-    std::fs::write(path, data).map_err(|error| format!("Could not save workspace list: {error}"))
+    let temporary = parent.join(format!(".workspaces-{}-{}.tmp", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos()));
+    std::fs::write(&temporary, data).map_err(|error| format!("Could not save workspace list: {error}"))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("Could not replace workspace list: {error}"));
+    }
+    Ok(())
 }
 
 fn workspace_slug(name: &str) -> Result<String, String> {
@@ -929,6 +958,8 @@ fn stop_instance_blocking(
 }
 
 fn stop_poc_vm_blocking(app: &AppHandle, delete: bool) -> Result<VmStatus, String> {
+    let directory = app.path().app_data_dir().map_err(|e|e.to_string())?;
+    let _lock = if delete { Some(workspace_store::MutationLock::acquire(&directory)?) } else { None };
     let status = stop_instance_blocking(app, POC_INSTANCE, delete)?;
     if delete {
         let mut workspaces = read_workspaces(app)?;
@@ -1268,6 +1299,8 @@ fn workspace_compose_file(
         }
     }
     if workspace.compose_file != compose_file {
+        let directory = app.path().app_data_dir().map_err(|e|e.to_string())?;
+        let _lock = workspace_store::MutationLock::acquire(&directory)?;
         let mut workspaces = read_workspaces(app)?;
         if let Some(saved) = workspaces.iter_mut().find(|item| item.id == workspace.id) {
             saved.compose_file = compose_file.clone();
@@ -1393,13 +1426,21 @@ fn check_workspace_agent_blocking(
 ) -> Result<AgentPreflight, String> {
     let workspace = workspace_record(app, workspace_id)?;
     let provider = agent_provider(provider_id)?;
-    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
     let home = app_lima_home(app)?;
+    check_agent_in_workspace(&home, &workspace, &provider)
+}
+
+fn check_agent_in_workspace(
+    home: &Path,
+    workspace: &Workspace,
+    provider: &AgentProvider,
+) -> Result<AgentPreflight, String> {
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
     if vm_state(&home, instance_name)? != "running" {
         return Err("Start this workspace's Linux VM before checking agent setup.".into());
     }
 
-    let (_, guest_home, _) = guest_user(&home, instance_name)?;
+    let (_, guest_home, _) = guest_user(home, instance_name)?;
     let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
     let guest_path_text = guest_path.to_string_lossy().into_owned();
     let script = format!(
@@ -1407,7 +1448,7 @@ fn check_workspace_agent_blocking(
         provider.executable
     );
     let output = run_limactl(
-        &home,
+        home,
         &[
             "shell",
             "--workdir",
@@ -1445,7 +1486,7 @@ fn check_workspace_agent_blocking(
     };
 
     Ok(AgentPreflight {
-        workspace_id: workspace.id,
+        workspace_id: workspace.id.clone(),
         provider_id: provider.id.to_owned(),
         provider_name: provider.name.to_owned(),
         installed,
@@ -1453,71 +1494,6 @@ fn check_workspace_agent_blocking(
         message,
         login_hint: provider.login_hint.to_owned(),
     })
-}
-
-fn open_workspace_agent_blocking(
-    app: &AppHandle,
-    workspace_id: &str,
-    provider_id: &str,
-    allow_network: bool,
-) -> Result<(), String> {
-    if !allow_network {
-        return Err("Approve network access before starting a cloud coding agent.".into());
-    }
-    let preflight = check_workspace_agent_blocking(app, workspace_id, provider_id)?;
-    if !preflight.installed {
-        return Err(preflight.message);
-    }
-    if !cfg!(target_os = "macos") {
-        return Err("Opening an agent terminal is currently supported on macOS only.".into());
-    }
-
-    let workspace = workspace_record(app, workspace_id)?;
-    let provider = agent_provider(provider_id)?;
-    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
-    let home = app_lima_home(app)?;
-    let (_, guest_home, _) = guest_user(&home, instance_name)?;
-    let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
-    let guest_path_text = guest_path.to_string_lossy().into_owned();
-    let limactl = find_executable("limactl")
-        .ok_or_else(|| "Lima is not installed. Install it before starting an agent.".to_owned())?;
-    let sessions = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?
-        .join("terminal-sessions");
-    std::fs::create_dir_all(&sessions)
-        .map_err(|error| format!("Could not prepare terminal session files: {error}"))?;
-    let script_path = sessions.join(format!("{}-agent-{}.command", workspace.id, provider.id));
-    let guest_command = format!(
-        "export PATH=\"$HOME/.local/bin:$PATH\"; exec {}",
-        shell_quote(provider.executable),
-    );
-    let script = format!(
-        "#!/bin/zsh\nexport LIMA_HOME={}\nexec {} shell --workdir {} {} sh -lc {}\n",
-        shell_quote(&home.to_string_lossy()),
-        shell_quote(&limactl.to_string_lossy()),
-        shell_quote(&guest_path_text),
-        shell_quote(instance_name),
-        shell_quote(&guest_command),
-    );
-    std::fs::write(&script_path, script)
-        .map_err(|error| format!("Could not prepare the agent command: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("Could not secure the agent command: {error}"))?;
-    }
-    let output = Command::new("/usr/bin/open")
-        .args(["-a", "Terminal"])
-        .arg(&script_path)
-        .output()
-        .map_err(|error| format!("Could not open Terminal: {error}"))?;
-    if !output.status.success() {
-        return Err(output_error(&output, "open the agent terminal"));
-    }
-    Ok(())
 }
 
 fn workspace_vm_status_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
@@ -1542,21 +1518,28 @@ fn refresh_workspace_compose_file_blocking(
 }
 
 fn start_workspace_vm_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
-    let workspace = workspace_record(app, workspace_id)?;
-    let instance_name = workspace
-        .vm_name
-        .as_deref()
-        .ok_or_else(|| "This older workspace uses the shared VM. Start it from the shared VM panel.".to_owned())?;
-    start_instance_blocking(app, instance_name, Some(workspace_id))
+    let directory = app.path().app_data_dir()
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?;
+    let status = workspace_controller::WorkspaceController::new(directory)
+        .set_running(workspace_id, true, true, |home, args| {
+            run_limactl_with_progress(app, &home.to_path_buf(), args, Some(workspace_id))
+        })?;
+    let _ = app.emit("vm-start-progress", VmProgress {
+        phase: "ready", message: "This workspace's Linux VM is ready.".into(),
+        downloaded_bytes: None, workspace_id: Some(workspace_id.to_owned()),
+    });
+    Ok(status)
 }
 
 fn stop_workspace_vm_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
-    let workspace = workspace_record(app, workspace_id)?;
-    let instance_name = workspace
-        .vm_name
-        .as_deref()
-        .ok_or_else(|| "This older workspace uses the shared VM. Stop it from the shared VM panel.".to_owned())?;
-    stop_instance_blocking(app, instance_name, false)
+    let directory = app.path().app_data_dir()
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?;
+    workspace_controller::WorkspaceController::new(directory)
+        .set_running(workspace_id, false, false, |home, args| {
+            let output = run_limactl(home, args)?;
+            if !output.status.success() { return Err(output_error(&output, "stop the workspace VM")); }
+            Ok(())
+        })
 }
 
 fn run_workspace_check_blocking(app: &AppHandle, workspace_id: &str) -> Result<String, String> {
@@ -1574,14 +1557,33 @@ fn run_workspace_check_blocking(app: &AppHandle, workspace_id: &str) -> Result<S
 }
 
 fn delete_workspace_blocking(app: &AppHandle, workspace_id: &str) -> Result<(), String> {
-    let workspace = workspace_record(app, workspace_id)?;
-    let instance_name = workspace
-        .vm_name
-        .as_deref()
-        .ok_or_else(|| "This older workspace shares a VM with other workspaces and cannot be deleted individually yet.".to_owned())?;
-    let _ = stop_instance_blocking(app, instance_name, true)?;
+    let directory = app.path().app_data_dir().map_err(|e|e.to_string())?;
+    let controller = workspace_controller::WorkspaceController::new(directory);
+    if controller.workspace(workspace_id)?.vm_name.is_some() {
+        return controller.delete(workspace_id, true);
+    }
+    let _lock = workspace_store::MutationLock::acquire(&app.path().app_data_dir().map_err(|e|e.to_string())?)?;
     let mut workspaces = read_workspaces(app)?;
-    workspaces.retain(|item| item.id != workspace.id);
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .cloned()
+        .ok_or_else(|| "That workspace is not in the Orvex workspace list.".to_owned())?;
+
+    if let Some(instance_name) = workspace.vm_name.as_deref() {
+        let _ = stop_instance_blocking(app, instance_name, true)?;
+        workspaces.retain(|item| item.id != workspace.id);
+    } else {
+        let legacy_count = workspaces.iter().filter(|item| item.vm_name.is_none()).count();
+        if legacy_count != 1 {
+            return Err(format!(
+                "This workspace shares the legacy VM with {} other workspaces. Delete the shared legacy VM to remove them together.",
+                legacy_count.saturating_sub(1),
+            ));
+        }
+        let _ = stop_instance_blocking(app, POC_INSTANCE, true)?;
+        workspaces.retain(|item| item.vm_name.is_some());
+    }
     write_workspaces(app, &workspaces)
 }
 
@@ -1607,20 +1609,52 @@ fn create_workspace_blocking(
     app: &AppHandle,
     name: String,
     repo_url: Option<String>,
+    base_branch: Option<String>,
     allow_network: bool,
     agent_provider_ids: Vec<String>,
 ) -> Result<WorkspaceCreationResult, String> {
+    let directory = app.path().app_data_dir()
+        .map_err(|error| format!("Could not locate Orvex app data: {error}"))?;
+    create_workspace_at(&directory, name, repo_url, base_branch, allow_network, agent_provider_ids, None, false,
+        |home, args, id| run_limactl_with_progress(app, &home.to_path_buf(), args, Some(id)))
+}
+
+fn create_workspace_at(
+    data_dir: &Path,
+    name: String,
+    repo_url: Option<String>,
+    base_branch: Option<String>,
+    allow_network: bool,
+    agent_provider_ids: Vec<String>,
+    local_project: Option<PathBuf>,
+    allow_unsupported_platform: bool,
+    mut run: impl FnMut(&Path, &[&str], &str) -> Result<(), String>,
+) -> Result<WorkspaceCreationResult, String> {
     let name = name.trim().to_owned();
     let slug = workspace_slug(&name)?;
+    if local_project.is_some() && (repo_url.is_some() || base_branch.is_some()) {
+        return Err("Use projectPath alone to import its current committed HEAD, or repoUrl with an optional branch.".into());
+    }
+    if !allow_network {
+        return Err("Approve internet access to download Linux and create this workspace VM.".into());
+    }
+    let snapshot = local_project.as_deref().map(project_import::ProjectSnapshot::prepare).transpose()?;
+    let preflight = match (&local_project, &snapshot) {
+        (Some(path), Some(snapshot)) => Some(project_requirements::local(path, &snapshot.commit)?),
+        _ => None,
+    };
+    if preflight.as_ref().is_some_and(|report| report.linux_compatibility == "unsupported") && !allow_unsupported_platform {
+        return Err("Project requires an Apple platform toolchain (Xcode/Apple SDKs), which this Linux VM cannot run. Use project_inspect for details. Set allowUnsupportedPlatform=true only if you intentionally want a source-editing workspace.".into());
+    }
     let repo_url = repo_url
         .filter(|url| !url.trim().is_empty())
         .map(|url| validate_public_https_repo_url(&url))
         .transpose()?;
-    if !allow_network {
-        return Err("Approve internet access to download Linux and create this workspace VM.".into());
-    }
-    if agent_provider_ids.is_empty() {
-        return Err("Choose at least one coding CLI to install in this workspace.".into());
+    let base_branch = base_branch
+        .filter(|branch| !branch.trim().is_empty())
+        .map(|branch| branch.trim().to_owned());
+    if base_branch.is_some() && repo_url.is_none() {
+        return Err("Choose a repository before setting its base branch.".into());
     }
     let mut selected_providers = Vec::new();
     for provider_id in agent_provider_ids {
@@ -1629,15 +1663,31 @@ fn create_workspace_blocking(
             selected_providers.push(provider);
         }
     }
-    let mut workspaces = read_workspaces(app)?;
+    let _lock = workspace_store::MutationLock::acquire(data_dir)?;
+    let mut workspaces = read_workspaces_at(&data_dir.join("workspaces.json"))?;
     if workspaces.iter().any(|workspace| workspace.id == slug) {
         return Err(format!("A workspace named “{name}” already exists."));
     }
 
+    let repo_url = snapshot.as_ref().and_then(|s| s.origin.clone()).or(repo_url);
+    let base_branch = snapshot.as_ref().map(|s| if s.branch.is_empty() { s.commit.clone() } else { s.branch.clone() }).or(base_branch);
     let instance_name = workspace_instance_name(&slug);
-    let _ = start_instance_blocking(app, &instance_name, Some(&slug))?;
-    let home = app_lima_home(app)?;
+    let home = data_dir.join("lima");
+    std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
+    if vm_state(&home, &instance_name)? != "notCreated" {
+        return Err("A VM with this workspace identity already exists. Inspect/delete it before recreating the workspace.".into());
+    }
+    let mut creation_guard = workspace_store::VmCreationGuard { home:home.clone(),instance:instance_name.clone(),committed:false };
+    run(&home, &["start", &format!("--name={instance_name}"), "--vm-type=vz", "--network=vzNAT",
+        "--mount-none", "--containerd=none", "--cpus=2", "--memory=2", "--disk=8", "--progress", "--yes"], &slug)?;
 
+    let bundle_path = format!("/tmp/orvex-{slug}.bundle");
+    if let Some(snapshot) = &snapshot {
+        let destination = format!("{instance_name}:{bundle_path}");
+        let output = run_limactl(&home, &["copy", snapshot.bundle.to_str().ok_or("Non-UTF-8 bundle path")?, &destination])?;
+        if !output.status.success() { return Err(output_error(&output, "transfer project snapshot")); }
+    }
+    let clone_source = if snapshot.is_some() { bundle_path.as_str() } else { repo_url.as_deref().unwrap_or_default() };
     const CREATE_WORKSPACE_SCRIPT: &str = r#"set -eu
 root="$HOME/orvex/workspaces"
 target="$root/$2"
@@ -1651,10 +1701,39 @@ if [ -n "$1" ]; then
   rmdir "$staging"
   trap 'rm -rf -- "$staging"' EXIT
   GIT_TERMINAL_PROMPT=0 git clone --progress -- "$1" "$staging"
+  base_branch="$3"
+  base_ref=""
+  if [ -n "$4" ]; then
+    base_ref="$4"
+    if [ -n "$5" ]; then git -C "$staging" remote set-url origin "$5"; else git -C "$staging" remote remove origin; fi
+  elif [ -n "$base_branch" ]; then
+    if ! git -C "$staging" check-ref-format --branch "$base_branch" >/dev/null 2>&1; then
+      printf 'Invalid base branch name.\n' >&2
+      exit 18
+    fi
+    base_ref="origin/$base_branch"
+    if ! git -C "$staging" show-ref --verify --quiet "refs/remotes/$base_ref"; then
+      printf 'Base branch was not found on origin: %s\n' "$base_branch" >&2
+      exit 19
+    fi
+  elif git -C "$staging" rev-parse --verify HEAD >/dev/null 2>&1; then
+    base_branch="$(git -C "$staging" branch --show-current)"
+    base_ref="$base_branch"
+  else
+    base_branch=""
+  fi
+  session_branch="orvex/$2"
+  if [ -n "$base_ref" ]; then
+    git -C "$staging" switch --no-track --create "$session_branch" "$base_ref"
+  else
+    git -C "$staging" switch --no-track --orphan "$session_branch"
+  fi
   mv -- "$staging" "$target"
+  printf 'ORVEX_SESSION_BRANCH=%s\nORVEX_BASE_BRANCH=%s\n' "$session_branch" "$base_branch"
 else
   mkdir "$target"
   printf '# Empty workspace\n\nCreated by Orvex.\n' > "$target/README.md"
+  printf 'ORVEX_SESSION_BRANCH=No repository yet\nORVEX_BASE_BRANCH=\n'
 fi
 "#;
     let output = run_limactl(
@@ -1666,14 +1745,32 @@ fi
             "-c",
             CREATE_WORKSPACE_SCRIPT,
             "orvex-workspace",
-            repo_url.as_deref().unwrap_or_default(),
+            clone_source,
             &slug,
+            base_branch.as_deref().unwrap_or_default(),
+            snapshot.as_ref().map(|s| s.commit.as_str()).unwrap_or_default(),
+            repo_url.as_deref().unwrap_or_default(),
         ],
     )?;
+    if snapshot.is_some() { let _ = run_limactl(&home, &["shell", &instance_name, "rm", "-f", "--", &bundle_path]); }
     if !output.status.success() {
         return Err(output_error(&output, "create the Linux workspace"));
     }
+    let creation_output = String::from_utf8_lossy(&output.stdout);
+    let session_branch = creation_output
+        .lines()
+        .find_map(|line| line.strip_prefix("ORVEX_SESSION_BRANCH="))
+        .ok_or_else(|| "The workspace was created, but its session branch was not reported.".to_owned())?;
+    let base_branch = creation_output
+        .lines()
+        .find_map(|line| line.strip_prefix("ORVEX_BASE_BRANCH="))
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned);
 
+    let requirements = if preflight.is_some() { preflight } else if repo_url.is_some() { Some(project_requirements::guest(&home, &instance_name, &slug)?) } else { None };
+    if requirements.as_ref().is_some_and(|report| report.linux_compatibility == "unsupported") && !allow_unsupported_platform {
+        return Err("The cloned project requires Xcode/Apple SDKs and cannot run in Linux. The newly allocated VM will be cleaned up. Use allowUnsupportedPlatform=true only for an intentional source-editing workspace.".into());
+    }
     let (project_config, setup_error) = match discover_project_config(&home, &instance_name, &slug) {
         Ok(config) => (config, None),
         Err(error) => (ProjectConfig { setup_commands: Vec::new(), compose_file: None }, Some(error)),
@@ -1681,11 +1778,8 @@ fi
     let workspace = Workspace {
         id: slug.clone(),
         name,
-        branch: if repo_url.is_some() {
-            "Repository cloned".into()
-        } else {
-            "No repository yet".into()
-        },
+        branch: session_branch.to_owned(),
+        base_branch,
         status: "Ready".into(),
         path: format!("~/orvex/workspaces/{slug}"),
         repo_url,
@@ -1694,13 +1788,14 @@ fi
         compose_file: project_config.compose_file.clone(),
     };
     workspaces.push(workspace.clone());
-    write_workspaces(app, &workspaces)?;
+    write_workspaces_at(&data_dir.join("workspaces.json"), &workspaces)?;
+    creation_guard.committed = true;
     let agent_installations = selected_providers
         .iter()
         .map(|provider| install_workspace_agent_blocking(&home, workspace.vm_name.as_deref().unwrap(), &slug, provider))
         .collect();
     let setup_commands = project_config.setup_commands;
-    Ok(WorkspaceCreationResult { workspace, agent_installations, setup_commands, setup_error })
+    Ok(WorkspaceCreationResult { workspace, agent_installations, setup_commands, setup_error, requirements })
 }
 
 #[tauri::command]
@@ -1724,11 +1819,12 @@ async fn create_workspace(
     app: AppHandle,
     name: String,
     repo_url: Option<String>,
+    base_branch: Option<String>,
     allow_network: bool,
     agent_provider_ids: Vec<String>,
 ) -> Result<WorkspaceCreationResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        create_workspace_blocking(&app, name, repo_url, allow_network, agent_provider_ids)
+        create_workspace_blocking(&app, name, repo_url, base_branch, allow_network, agent_provider_ids)
     })
     .await
     .map_err(|error| format!("Workspace creation task failed: {error}"))?
@@ -1792,18 +1888,309 @@ async fn check_workspace_agent(
     .map_err(|error| format!("Agent preflight task failed: {error}"))?
 }
 
-#[tauri::command]
-async fn open_workspace_agent(
-    app: AppHandle,
-    workspace_id: String,
-    provider_id: String,
-    allow_network: bool,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        open_workspace_agent_blocking(&app, &workspace_id, &provider_id, allow_network)
-    })
-    .await
-    .map_err(|error| format!("Agent launch task failed: {error}"))?
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliWorkspace {
+    id: String,
+    name: String,
+    branch: String,
+    base_branch: Option<String>,
+    path: String,
+    vm_name: Option<String>,
+    vm_state: String,
+    agent_providers: Vec<String>,
+    compose_file: Option<String>,
+}
+
+fn cli_app_data_dir() -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| "Could not find the current user's home directory.".to_owned())?;
+        return Ok(PathBuf::from(home).join("Library/Application Support/com.orvex.desktop"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let app_data = std::env::var_os("APPDATA")
+            .ok_or_else(|| "Could not find the Windows roaming app data directory.".to_owned())?;
+        return Ok(PathBuf::from(app_data).join("com.orvex.desktop"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+            .ok_or_else(|| "Could not find the current user's data directory.".to_owned())?;
+        if !base.is_absolute() {
+            return Err("XDG_DATA_HOME must be an absolute path.".into());
+        }
+        return Ok(base.join("com.orvex.desktop"));
+    }
+    #[allow(unreachable_code)]
+    Err("The Orvex CLI is not supported on this operating system yet.".into())
+}
+
+fn cli_workspace_context(workspace_id: &str) -> Result<(Workspace, PathBuf, String), String> {
+    let data_dir = cli_app_data_dir()?;
+    let workspace = workspace_controller::WorkspaceController::new(data_dir.clone())
+        .workspace(workspace_id)?;
+    let instance_name = workspace
+        .vm_name
+        .clone()
+        .ok_or_else(|| "This workspace uses the legacy shared VM. CLI execution requires a dedicated workspace VM.".to_owned())?;
+    Ok((workspace, data_dir.join("lima"), instance_name))
+}
+
+fn cli_list_workspaces(json: bool) -> Result<i32, String> {
+    let data_dir = cli_app_data_dir()?;
+    let workspaces = workspace_controller::WorkspaceController::new(data_dir.clone()).list()?;
+    let lima_home = data_dir.join("lima");
+    let mut items = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
+        let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+        let vm_state = vm_state(&lima_home, instance_name).unwrap_or_else(|error| format!("unavailable: {error}"));
+        items.push(CliWorkspace {
+            id: workspace.id,
+            name: workspace.name,
+            branch: workspace.branch,
+            base_branch: workspace.base_branch,
+            path: workspace.path,
+            vm_name: workspace.vm_name,
+            vm_state,
+            agent_providers: workspace.agent_providers,
+            compose_file: workspace.compose_file,
+        });
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&items).map_err(|error| error.to_string())?);
+    } else if items.is_empty() {
+        println!("No Orvex workspaces yet.");
+    } else {
+        println!("ID\tNAME\tVM\tBRANCH\tPATH");
+        for item in items {
+            println!("{}\t{}\t{}\t{}\t{}", item.id, item.name, item.vm_state, item.branch, item.path);
+        }
+    }
+    Ok(0)
+}
+
+fn cli_workspace_status(workspace_id: &str, json: bool) -> Result<i32, String> {
+    let data_dir = cli_app_data_dir()?;
+    let workspace = workspace_controller::WorkspaceController::new(data_dir.clone())
+        .workspace(workspace_id)?;
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    let state = vm_state(&data_dir.join("lima"), instance_name)?;
+    let item = CliWorkspace {
+        id: workspace.id,
+        name: workspace.name,
+        branch: workspace.branch,
+        base_branch: workspace.base_branch,
+        path: workspace.path,
+        vm_name: workspace.vm_name,
+        vm_state: state,
+        agent_providers: workspace.agent_providers,
+        compose_file: workspace.compose_file,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&item).map_err(|error| error.to_string())?);
+    } else {
+        println!("Workspace: {} ({})\nVM: {}\nBranch: {}\nPath: {}\nAgents: {}\nCompose: {}",
+            item.name,
+            item.id,
+            item.vm_state,
+            item.branch,
+            item.path,
+            if item.agent_providers.is_empty() { "none".to_owned() } else { item.agent_providers.join(", ") },
+            item.compose_file.as_deref().unwrap_or("none"),
+        );
+    }
+    Ok(0)
+}
+
+fn cli_workspace_vm_action(workspace_id: &str, start: bool, network: bool) -> Result<i32, String> {
+    let status = workspace_controller::WorkspaceController::new(cli_app_data_dir()?)
+        .set_running(workspace_id, start, network, |home, args| {
+            let output = run_limactl(home, args)?;
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() { return Err(output_error(&output, "change workspace VM state")); }
+            Ok(())
+        })?;
+    println!("Workspace VM `{}` is {}.", status.instance_name, status.state);
+    Ok(0)
+}
+
+fn cli_workspace_exec(workspace_id: &str, network: bool, command: &[String]) -> Result<i32, String> {
+    let controller = workspace_controller::WorkspaceController::new(cli_app_data_dir()?);
+    let status = controller.command(workspace_id, network, command)?.status()
+        .map_err(|error| format!("Could not start the Lima command: {error}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn workspace_command(controller: &workspace_controller::WorkspaceController, workspace_id: &str,
+    network: bool, command: &[String]) -> Result<Command, String> {
+    if command.is_empty() {
+        return Err("Provide a command after `--`, for example `orvex workspace exec <id> -- codex --version`.".into());
+    }
+    let workspace = controller.workspace(workspace_id)?;
+    let instance_name = workspace.vm_name.clone().ok_or("A dedicated workspace VM is required.")?;
+    let lima_home = controller.lima_home();
+    if vm_state(&lima_home, &instance_name)? != "running" {
+        return Err("Start the workspace VM in Orvex before running a command.".into());
+    }
+    let (guest_user, guest_home, passwordless_sudo) = guest_user(&lima_home, &instance_name)?;
+    let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
+    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let path_check = run_limactl(&lima_home, &["shell", &instance_name, "test", "-d", &guest_path_text])?;
+    if !path_check.status.success() {
+        return Err(format!("Workspace folder was not found in Linux: {guest_path_text}"));
+    }
+    let limactl = find_executable("limactl")
+        .ok_or_else(|| "Lima is not installed. Install it before using Orvex CLI commands.".to_owned())?;
+    let mut invocation = Command::new(limactl);
+    invocation.env("LIMA_HOME", &lima_home).args(["shell", "--workdir", &guest_path_text, &instance_name]);
+    if network {
+        invocation.args(command);
+    } else {
+        if !passwordless_sudo {
+            return Err("Offline command execution needs passwordless sudo to create a guest network namespace.".into());
+        }
+        let uid = guest_identity_id(&lima_home, &instance_name, "-u")?;
+        let gid = guest_identity_id(&lima_home, &instance_name, "-g")?;
+        if uid == 0 || gid == 0 {
+            return Err("Offline command execution needs a non-root Lima guest user.".into());
+        }
+        let command_text = command.iter().map(|part| shell_quote(part)).collect::<Vec<_>>().join(" ");
+        let guest_command = format!("cd {} && exec {command_text}", shell_quote(&guest_path_text));
+        invocation.args([
+            "sudo", "-n", "unshare", "--user", "--map-users=0:0:1",
+            &format!("--map-users={uid}:{uid}:1"), "--map-groups=0:0:1",
+            &format!("--map-groups={gid}:{gid}:1"), "--net", "--fork", "--",
+            "su", "-s", "/bin/bash", "-c", &guest_command, &guest_user,
+        ]);
+    }
+    Ok(invocation)
+}
+
+fn cli_agent_check(workspace_id: &str, provider_id: &str, json: bool) -> Result<i32, String> {
+    let (workspace, lima_home, _) = cli_workspace_context(workspace_id)?;
+    let provider = agent_provider(provider_id)?;
+    let result = check_agent_in_workspace(&lima_home, &workspace, &provider)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?);
+    } else {
+        println!("{}: {}", result.provider_name, result.message);
+        if let Some(version) = result.version {
+            println!("Version: {version}");
+        }
+        println!("{}", result.login_hint);
+        println!("Authentication is not checked by Orvex.");
+    }
+    Ok(if result.installed { 0 } else { 1 })
+}
+
+fn print_cli_help() {
+    println!("Orvex CLI — workspace access for scripts and the user's main agent\n\nUSAGE:\n  orvex tool <tool-name> '<JSON arguments>'\n  orvex mcp-config [--copilot]\n  orvex mcp\n  orvex workspace create <name> (--project <absolute-path> | --repo <https-url> [--branch <branch>]) --network\n  orvex workspace list [--json]\n  orvex workspace status <workspace-id> [--json]\n  orvex workspace start <workspace-id> --network\n  orvex workspace stop <workspace-id>\n  orvex workspace exec <workspace-id> [--network] -- <command> [args...]\n  orvex agent check <workspace-id> <provider-id> [--json]\n\nEXECUTION POLICY:\n  VM start requires the explicit --network grant. Commands run in an already-running VM and are offline by default.\n  Add --network before -- only when you approve network access for that command.\n  Orvex does not start coding agents from the desktop UI; exec runs only the command you provide.\n\nPROVIDER IDS: codex, claude, copilot, pi, cursor, gemini");
+}
+
+pub fn cli_main() -> i32 {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("tool") {
+        let result = (|| {
+            if args.len() != 3 { return Err("Usage: orvex tool <tool-name> '<JSON arguments>'".to_owned()); }
+            let values = serde_json::from_str(&args[2]).map_err(|e| format!("Invalid JSON: {e}"))?;
+            mcp::call(&args[1], &values)
+        })();
+        return match result { Ok(value) => { println!("{value}"); 0 }, Err(error) => { eprintln!("{error}"); 1 } };
+    }
+    if args.first().map(String::as_str) == Some("mcp-config") {
+        let executable = match std::env::current_exe() { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 1 } };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let config = if args.get(1).map(String::as_str) == Some("--copilot") {
+            serde_json::json!({"mcpServers":{"orvex":{"type":"stdio","command":executable,"args":["mcp"],"env":{"HOME":home},"tools":["*"],"timeout":600000}}})
+        } else {
+            serde_json::json!({"servers":{"orvex":{"type":"stdio","command":executable,"args":["mcp"],"env":{"HOME":home}}}})
+        };
+        println!("{config}");
+        return 0;
+    }
+    if args.first().map(String::as_str) == Some("mcp") {
+        return match mcp::serve() { Ok(()) => 0, Err(error) => { eprintln!("{error}"); 1 } };
+    }
+    if args.first().map(String::as_str) == Some("workspace") && args.get(1).map(String::as_str) == Some("create") {
+        return match mcp::cli_create(&args[2..]) { Ok(value) => { println!("{value}"); 0 }, Err(error) => { eprintln!("{error}"); 1 } };
+    }
+    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_cli_help();
+        return 0;
+    }
+    if args.len() == 1 && args[0] == "--version" {
+        println!("orvex {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+    if !cfg!(target_os = "macos") {
+        eprintln!("orvex: workspace execution currently requires the macOS Lima runtime.");
+        return 1;
+    }
+    let result = match args.first().map(String::as_str) {
+        Some("workspace") if args.get(1).map(String::as_str) == Some("list") => {
+            let json = args.iter().any(|arg| arg == "--json");
+            if args.iter().any(|arg| arg != "workspace" && arg != "list" && arg != "--json") {
+                Err("Unexpected argument for `workspace list`.".into())
+            } else { cli_list_workspaces(json) }
+        }
+        Some("workspace") if args.get(1).map(String::as_str) == Some("status") => {
+            match (args.get(2), args.get(3)) {
+                (Some(id), None) => cli_workspace_status(id, false),
+                (Some(id), Some(json)) if json == "--json" && args.len() == 4 => cli_workspace_status(id, true),
+                _ => Err("Usage: orvex workspace status <workspace-id> [--json]".into()),
+            }
+        }
+        Some("workspace") if args.get(1).map(String::as_str) == Some("start") => {
+            match (args.get(2), args.get(3), args.len()) {
+                (Some(id), Some(network), 4) if network == "--network" => cli_workspace_vm_action(id, true, true),
+                (Some(id), None, 3) => cli_workspace_vm_action(id, true, false),
+                _ => Err("Usage: orvex workspace start <workspace-id> --network".into()),
+            }
+        }
+        Some("workspace") if args.get(1).map(String::as_str) == Some("stop") => {
+            match (args.get(2), args.len()) {
+                (Some(id), 3) => cli_workspace_vm_action(id, false, false),
+                _ => Err("Usage: orvex workspace stop <workspace-id>".into()),
+            }
+        }
+        Some("workspace") if args.get(1).map(String::as_str) == Some("exec") => {
+            let Some(id) = args.get(2) else {
+                eprintln!("Usage: orvex workspace exec <workspace-id> [--network] -- <command> [args...]");
+                return 2;
+            };
+            let mut network = false;
+            let mut index = 3;
+            while index < args.len() && args[index] != "--" {
+                if args[index] == "--network" { network = true; } else {
+                    eprintln!("Unknown option `{}` before `--`.", args[index]);
+                    return 2;
+                }
+                index += 1;
+            }
+            if args.get(index).map(String::as_str) != Some("--") {
+                Err("Separate Orvex options from the guest command with `--`.".into())
+            } else {
+                cli_workspace_exec(id, network, &args[index + 1..])
+            }
+        }
+        Some("agent") if args.get(1).map(String::as_str) == Some("check") => {
+            match (args.get(2), args.get(3), args.get(4), args.len()) {
+                (Some(id), Some(provider), None, 4) => cli_agent_check(id, provider, false),
+                (Some(id), Some(provider), Some(json), 5) if json == "--json" => cli_agent_check(id, provider, true),
+                _ => Err("Usage: orvex agent check <workspace-id> <provider-id> [--json]".into()),
+            }
+        }
+        _ => Err("Unknown command. Run `orvex --help` for usage.".into()),
+    };
+    match result {
+        Ok(code) => code,
+        Err(error) => { eprintln!("orvex: {error}"); 1 }
+    }
 }
 
 #[tauri::command]
@@ -1939,7 +2326,6 @@ pub fn run() {
             open_workspace_terminal,
             list_agent_providers,
             check_workspace_agent,
-            open_workspace_agent,
             get_lima_status,
             install_lima,
             get_vm_status,
