@@ -4,10 +4,10 @@ import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 type AppInfo = { name: string; version: string; platform: string };
-type Workspace = { id: string; name: string; branch: string; status: string; path: string; repoUrl: string | null };
+type Workspace = { id: string; name: string; branch: string; status: string; path: string; repoUrl: string | null; vmName: string | null };
 type LimaStatus = { installed: boolean; version: string | null; installSupported: boolean; installer: string | null };
 type VmStatus = { state: "notCreated" | "running" | "stopped" | string; instanceName: string; imageBytes: number | null };
-type VmProgress = { phase: string; message: string; downloadedBytes?: number | null };
+type VmProgress = { phase: string; message: string; downloadedBytes?: number | null; workspaceId?: string };
 
 const vmStages = [
   { phase: "checking", label: "Check" },
@@ -18,9 +18,17 @@ const vmStages = [
   { phase: "ready", label: "Ready" },
 ];
 
+function workspaceSlugPreview(name: string) {
+  return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
 function App() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceVms, setWorkspaceVms] = useState<Record<string, VmStatus>>({});
+  const [workspaceVmProgress, setWorkspaceVmProgress] = useState<Record<string, VmProgress>>({});
+  const [workspaceVmAction, setWorkspaceVmAction] = useState<string | null>(null);
+  const [workspaceVmError, setWorkspaceVmError] = useState<string | null>(null);
   const [lima, setLima] = useState<LimaStatus | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [vmAction, setVmAction] = useState<string | null>(null);
@@ -32,7 +40,7 @@ function App() {
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
-  const [allowRepoNetwork, setAllowRepoNetwork] = useState(false);
+  const [allowVmNetwork, setAllowVmNetwork] = useState(false);
   const [workspaceCreating, setWorkspaceCreating] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [terminalAction, setTerminalAction] = useState<string | null>(null);
@@ -49,18 +57,35 @@ function App() {
       invoke<LimaStatus>("get_lima_status"),
       invoke<VmStatus>("get_vm_status"),
     ])
-      .then(([appInfo, items, limaStatus, vmStatus]) => { setInfo(appInfo); setWorkspaces(items); setLima(limaStatus); setVm(vmStatus); })
+      .then(async ([appInfo, items, limaStatus, vmStatus]) => {
+        setInfo(appInfo);
+        setWorkspaces(items);
+        setLima(limaStatus);
+        setVm(vmStatus);
+        const statuses = await Promise.all(items.map(async (workspace) => {
+          try {
+            return [workspace.id, await invoke<VmStatus>("get_workspace_vm_status", { workspaceId: workspace.id })] as const;
+          } catch {
+            return [workspace.id, null] as const;
+          }
+        }));
+        setWorkspaceVms(Object.fromEntries(statuses.filter((entry): entry is readonly [string, VmStatus] => entry[1] !== null)));
+      })
       .catch((reason: unknown) => setError(String(reason)));
   }, []);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    listen<VmProgress>("vm-start-progress", ({ payload }) => setVmProgress((current) =>
-      payload.phase === "downloading" && payload.downloadedBytes == null && current?.phase === "downloading"
+    listen<VmProgress>("vm-start-progress", ({ payload }) => {
+      if (payload.workspaceId) {
+        setWorkspaceVmProgress((current) => ({ ...current, [payload.workspaceId as string]: payload }));
+        return;
+      }
+      setVmProgress((current) => payload.phase === "downloading" && payload.downloadedBytes == null && current?.phase === "downloading"
         ? { ...payload, downloadedBytes: current.downloadedBytes }
-        : payload,
-    ))
+        : payload);
+    })
       .then((stopListening) => {
         if (disposed) stopListening();
         else unlisten = stopListening;
@@ -109,14 +134,14 @@ function App() {
   function openWorkspaceDialog() {
     setWorkspaceName("");
     setRepoUrl("");
-    setAllowRepoNetwork(false);
+    setAllowVmNetwork(false);
     setWorkspaceError(null);
     setWorkspaceDialogOpen(true);
   }
 
   async function createWorkspace() {
-    if (vm?.state !== "running") {
-      setWorkspaceError("Start the Linux VM before creating a workspace.");
+    if (!lima?.installed) {
+      setWorkspaceError("Install Lima before creating a workspace VM.");
       return;
     }
     setWorkspaceCreating(true);
@@ -125,17 +150,49 @@ function App() {
       const workspace = await invoke<Workspace>("create_workspace", {
         name: workspaceName,
         repoUrl: repoUrl.trim() || null,
-        allowNetwork: allowRepoNetwork,
+        allowNetwork: allowVmNetwork,
       });
       setWorkspaces((current) => [workspace, ...current]);
+      const workspaceVm: VmStatus = { state: "running", instanceName: workspace.vmName ?? "", imageBytes: null };
+      setWorkspaceVms((current) => ({ ...current, [workspace.id]: workspaceVm }));
       setWorkspaceDialogOpen(false);
       setWorkspaceName("");
       setRepoUrl("");
-      setAllowRepoNetwork(false);
+      setAllowVmNetwork(false);
+      setWorkspaceVmProgress((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
     } catch (reason) {
       setWorkspaceError(String(reason));
     } finally {
       setWorkspaceCreating(false);
+    }
+  }
+
+  async function runWorkspaceVmAction(workspace: Workspace, action: "start" | "stop") {
+    const actionKey = `${workspace.id}:${action}`;
+    setWorkspaceVmAction(actionKey);
+    setWorkspaceVmError(null);
+    try {
+      const status = await invoke<VmStatus>(action === "start" ? "start_workspace_vm" : "stop_workspace_vm", { workspaceId: workspace.id });
+      setWorkspaceVms((current) => ({ ...current, [workspace.id]: status }));
+    } catch (reason) {
+      setWorkspaceVmError(`${workspace.name}: ${String(reason)}`);
+    } finally {
+      setWorkspaceVmAction(null);
+    }
+  }
+
+  async function deleteWorkspace(workspace: Workspace) {
+    if (!window.confirm(`Delete “${workspace.name}” and permanently remove its dedicated VM and files?`)) return;
+    setWorkspaceVmAction(`${workspace.id}:delete`);
+    setWorkspaceVmError(null);
+    try {
+      await invoke("delete_workspace", { workspaceId: workspace.id });
+      setWorkspaces((current) => current.filter((item) => item.id !== workspace.id));
+      setWorkspaceVms((current) => { const next = { ...current }; delete next[workspace.id]; return next; });
+    } catch (reason) {
+      setWorkspaceVmError(`${workspace.name}: ${String(reason)}`);
+    } finally {
+      setWorkspaceVmAction(null);
     }
   }
 
@@ -170,6 +227,16 @@ function App() {
       } else {
         const next = await invoke<VmStatus>(commands[action]);
         setVm(next);
+        setWorkspaceVms((current) => {
+          const legacyIds = workspaces.filter((workspace) => !workspace.vmName).map((workspace) => workspace.id);
+          if (action === "delete") {
+            const remaining = { ...current };
+            legacyIds.forEach((id) => delete remaining[id]);
+            return remaining;
+          }
+          return Object.fromEntries([...Object.entries(current), ...legacyIds.map((id) => [id, next] as const)]);
+        });
+        if (action === "delete") setWorkspaces((current) => current.filter((workspace) => workspace.vmName));
         if (action === "start") {
           setVmProgress({ phase: "ready", message: "Linux VM is ready." });
         }
@@ -193,7 +260,7 @@ function App() {
     : `${Math.floor(vmProgress.downloadedBytes / 1024).toLocaleString()} KB downloaded · Lima does not report the total image size.`;
 
   async function deleteVm() {
-    if (window.confirm("Delete the Orvex proof-of-concept VM and its disk?")) {
+    if (window.confirm("Delete the legacy shared VM and permanently erase all older workspaces stored on it? This cannot be undone.")) {
       await runVmAction("delete");
     }
   }
@@ -216,7 +283,7 @@ function App() {
         <div className="runtime-icon">{lima?.installed ? "✓" : "⌁"}</div>
         <div className="runtime-copy">
           <div className="runtime-title-row"><h2>Linux runtime</h2><span className={`runtime-badge ${lima?.installed ? "ready" : "needs-setup"}`}>{lima ? (lima.installed ? "READY" : "SETUP REQUIRED") : "CHECKING"}</span></div>
-          <p>{lima?.installed ? `Lima is installed${lima.version ? ` · ${lima.version}` : ""}. VM creation is not enabled yet.` : "Lima provides lightweight Linux virtual machines on macOS. Installing it requires an internet connection; Orvex will not start a VM during setup."}</p>
+          <p>{lima?.installed ? `Lima is installed${lima.version ? ` · ${lima.version}` : ""}. Each new workspace gets its own Linux VM.` : "Lima provides lightweight Linux virtual machines on macOS. Installing it requires an internet connection; Orvex will not start a VM during setup."}</p>
           {runtimeMessage && <small className="runtime-feedback">{runtimeMessage}</small>}
           {runtimeError && <small className="runtime-feedback runtime-feedback-error">{runtimeError}</small>}
           {lima && !lima.installed && lima.installSupported && <small className="runtime-install-note">Install method: Homebrew ({lima.installer})</small>}
@@ -228,14 +295,14 @@ function App() {
               {installing ? <><span className="spinner"/> Installing…</> : "Install Lima"}
             </button>}
       </section>
-      <section className="vm-card" aria-live="polite">
+      {workspaces.some((workspace) => !workspace.vmName) && <section className="vm-card" aria-live="polite">
         <div className="vm-heading">
-          <div><div className="eyebrow">RUNTIME PROOF OF CONCEPT</div><h2>Linux VM</h2></div>
+          <div><div className="eyebrow">EXISTING WORKSPACES</div><h2>Legacy shared VM</h2></div>
           <span className={`runtime-badge ${vm?.state === "running" ? "ready" : "needs-setup"}`}>{vm?.state?.replace(/[A-Z]/g, (letter) => ` ${letter}`).toUpperCase() ?? "CHECKING"}</span>
         </div>
-        <p className="vm-description">Start an app-owned Lima VM, run a fixed <code>uname -a</code> check, then stop or delete it. Host folders are not mounted and containerd is off.</p>
+        <p className="vm-description">These older workspaces still share one VM. New workspaces get separate VMs. Stopping or deleting this VM affects every older workspace.</p>
         <p className="vm-image-cache">{vm?.imageBytes != null ? `Ubuntu image cached · ${Math.floor(vm.imageBytes / 1024).toLocaleString()} KB` : "Ubuntu image not downloaded yet"}</p>
-        <div className="network-consent"><strong>The Lima VM itself has network access.</strong> Open Terminal starts offline inside a Linux network namespace with no active network interface or route. Choose “Open with network” to grant that terminal the VM’s network access. Other guest processes remain networked.</div>
+        <div className="network-consent"><strong>This shared VM has network access.</strong> Offline terminals use a Linux network namespace; other guest processes remain networked.</div>
         {vmError && <div className="vm-error">{vmError}</div>}
         {vmOutput && <pre className="vm-output">{vmOutput}</pre>}
         {vmAction === "start" && <div className="vm-progress" role="status" aria-live="polite">
@@ -255,35 +322,54 @@ function App() {
           </>}
           {vm && vm.state !== "notCreated" && <button className="secondary-button" disabled={vmAction !== null} onClick={deleteVm}>{vmAction === "delete" ? "Deleting…" : "Delete VM"}</button>}
         </div>
-      </section>
+      </section>}
       {terminalError && <div className="notice error" role="alert">{terminalError}</div>}
+      {workspaceVmError && <div className="notice error" role="alert">{workspaceVmError}</div>}
       {workspaces.length === 0 ? <div className="empty-card">
         <div className="empty-illustration"><div className="orbit orbit-one"/><div className="orbit orbit-two"/><div className="cube">◈</div><span className="spark spark-one">✳</span><span className="spark spark-two">✦</span></div>
-        <h2>Nothing here yet</h2><p>Create an empty workspace inside the Linux VM.<br className="desktop-break"/> Repository import comes in the next step.</p>
-        <button className="primary-button" onClick={openWorkspaceDialog}>＋ &nbsp;Create your first workspace</button><span className="coming-soon">The workspace directory stays inside the VM</span>
-      </div> : <div className="workspace-list">{workspaces.map((w) => <article className="workspace-card" key={w.id}><div className="workspace-details"><b>{w.name}</b><p>{w.branch}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}</div><div className="workspace-controls"><span className="status">{w.status}</span><div className="workspace-terminal-actions"><button className="secondary-button" disabled={vm?.state !== "running" || terminalAction !== null} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={vm?.state !== "running" || terminalAction !== null} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div></div></article>)}</div>}
+        <h2>Nothing here yet</h2><p>Create a workspace with its own Linux VM.<br className="desktop-break"/> Its code and lifecycle stay separate from other workspaces.</p>
+        <button className="primary-button" onClick={openWorkspaceDialog}>＋ &nbsp;Create your first workspace</button><span className="coming-soon">Each workspace uses a separate Linux VM</span>
+      </div> : <div className="workspace-list">{workspaces.map((w) => {
+        const workspaceVm = workspaceVms[w.id];
+        const state = workspaceVm?.state ?? "checking";
+        const isLegacy = !w.vmName;
+        const vmActionBusy = workspaceVmAction?.startsWith(`${w.id}:`) ?? false;
+        return <article className="workspace-card" key={w.id}>
+          <div className="workspace-details"><b>{w.name}</b><p>{w.branch}</p><small className="workspace-path">{w.path}</small>{w.repoUrl && <small className="workspace-path">{w.repoUrl}</small>}
+            <span className={`runtime-badge ${state === "running" ? "ready" : "needs-setup"}`}>{isLegacy ? "SHARED LEGACY VM" : `WORKSPACE VM · ${state.toUpperCase()}`}</span>
+          </div>
+          <div className="workspace-controls"><span className="status">{w.status}</span>
+            {!isLegacy && <div className="workspace-terminal-actions">
+              {state !== "running" && <button className="primary-button" disabled={!lima?.installed || vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "start")}>{workspaceVmAction === `${w.id}:start` ? <><span className="spinner"/> Starting…</> : state === "stopped" ? "Resume VM" : "Start VM"}</button>}
+              {state === "running" && <button className="secondary-button" disabled={vmActionBusy || workspaceVmAction !== null} onClick={() => void runWorkspaceVmAction(w, "stop")}>{workspaceVmAction === `${w.id}:stop` ? "Stopping…" : "Stop VM"}</button>}
+              <button className="danger-button" disabled={vmActionBusy || workspaceVmAction !== null} onClick={() => void deleteWorkspace(w)}>{workspaceVmAction === `${w.id}:delete` ? "Deleting…" : "Delete workspace"}</button>
+            </div>}
+            {!isLegacy && workspaceVmAction === `${w.id}:start` && <small className="runtime-feedback">{workspaceVmProgress[w.id]?.message ?? "Starting this workspace's VM…"}</small>}
+            <div className="workspace-terminal-actions"><button className="secondary-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div>
+          </div>
+        </article>;
+      })}</div>}
       <footer className="footer"><span>Local-first by design</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
     {workspaceDialogOpen && <div className="modal-scrim">
       <form className="workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" onSubmit={(event) => { event.preventDefault(); void createWorkspace(); }}>
         <div className="eyebrow">NEW WORKSPACE</div>
-        <h2 id="workspace-dialog-title">Create an empty workspace</h2>
-        <p>This creates a folder inside the shared Linux VM; workspaces are directories, not separate VMs. You can optionally clone a public HTTPS repository. No host folder or credentials are shared.</p>
+        <h2 id="workspace-dialog-title">Create a workspace VM</h2>
+        <p>Orvex creates a separate Linux VM for this workspace and stores its files inside that VM. First creation downloads the Ubuntu image. You can optionally clone a public HTTPS repository.</p>
         <label htmlFor="workspace-name">Workspace name</label>
         <input id="workspace-name" autoFocus maxLength={64} value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="e.g. api-refactor" />
         <label htmlFor="repository-url">Public HTTPS Git URL <span>(optional)</span></label>
-        <input id="repository-url" type="url" value={repoUrl} onChange={(event) => { setRepoUrl(event.target.value); setAllowRepoNetwork(false); }} placeholder="https://github.com/org/repository.git" />
-        {repoUrl.trim() && <label className="network-approval"><input type="checkbox" checked={allowRepoNetwork} onChange={(event) => setAllowRepoNetwork(event.target.checked)} />
-          I approve using this VM’s current internet connection for this clone.
-        </label>}
-        <div className={`workspace-dialog-note ${vm?.state === "running" ? "" : "needs-vm"}`}>
-          {vm?.state !== "running" ? "Start the Linux VM before creating a workspace." : repoUrl.trim() ? "Network is already enabled in this proof VM; this approval applies to the clone action only and does not firewall other guest processes." : "No network is used when creating an empty workspace."}
-        </div>
+        <input id="repository-url" type="url" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/org/repository.git" />
+        <label className="network-approval"><input type="checkbox" checked={allowVmNetwork} onChange={(event) => setAllowVmNetwork(event.target.checked)} />
+          I approve downloading Linux and giving this workspace VM internet access{repoUrl.trim() ? ", including cloning this repository" : ""}.
+        </label>
+        <div className="workspace-dialog-note needs-vm">This approval enables the VM's network; Orvex does not yet enforce a per-VM firewall. The VM can remain online after creation.</div>
+        {workspaceCreating && <div className="vm-progress" role="status" aria-live="polite"><div className="vm-progress-current"><span className="spinner"/><div><strong>{workspaceVmProgress[workspaceSlugPreview(workspaceName)]?.message ?? "Creating the dedicated Linux VM…"}</strong><small>First creation downloads and prepares Ubuntu.</small></div></div></div>}
         {workspaceError && <div className="vm-error" role="alert">{workspaceError}</div>}
         <div className="vm-actions workspace-dialog-actions">
           <button type="button" className="secondary-button" disabled={workspaceCreating} onClick={() => setWorkspaceDialogOpen(false)}>Cancel</button>
-          <button type="submit" className="primary-button" disabled={workspaceCreating || vm?.state !== "running" || !workspaceName.trim() || (Boolean(repoUrl.trim()) && !allowRepoNetwork)}>
-            {workspaceCreating ? <><span className="spinner"/> {repoUrl.trim() ? "Cloning…" : "Creating…"}</> : "Create workspace"}
+          <button type="submit" className="primary-button" disabled={workspaceCreating || !lima?.installed || !workspaceName.trim() || !allowVmNetwork}>
+            {workspaceCreating ? <><span className="spinner"/> {repoUrl.trim() ? "Provisioning and cloning…" : "Provisioning VM…"}</> : "Create workspace"}
           </button>
         </div>
       </form>

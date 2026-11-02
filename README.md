@@ -1,6 +1,6 @@
 # Orvex
 
-Orvex is a local-first desktop app for creating isolated development task workspaces. The product is in its first scaffold milestone; workspace provisioning is not implemented yet.
+Orvex is a local-first desktop app for creating development task workspaces and working in them with coding-agent CLIs.
 
 ## Development prerequisites
 
@@ -18,8 +18,8 @@ pnpm dev
 
 `pnpm dev` launches the Tauri desktop application. `pnpm build` checks and builds the frontend; `pnpm check:rust` checks the Rust workspace.
 
-## Current milestone
+## Current capabilities
 
-The desktop window loads a React dashboard. Rust-backed Tauri commands report app/platform information and an empty workspace list. The “new workspace” actions remain disabled. No VM, container, Git, credential or agent integrations are present yet.
+On macOS, each newly created workspace gets its own Lima Linux VM, and its terminal and VM lifecycle are managed independently. Creating a workspace downloads/prepares Ubuntu and leaves that VM with internet access after an explicit confirmation. The default terminal starts in a Linux network namespace without a usable route; opening a terminal with the VM's network access requires confirmation.
 
-See [implementation plan](output/IMPLEMENTATION_PLAN.md), [architecture recommendation](output/ARCHITECTURE_RECOMMENDATION.md) and the [research dossier](research/README.md).
+Workspaces created by the earlier prototype use a shared VM; there is no migration flow, so delete that VM if you want to discard those workspaces and start fresh. Per-VM firewall controls, AI-agent sessions, Docker/Compose services, Windows runtimes, and project dependency setup are not implemented yet. See the [roadmap](ROADMAP.md) for status and next steps.

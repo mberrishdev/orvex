@@ -27,6 +27,9 @@ struct Workspace {
     path: String,
     #[serde(default)]
     repo_url: Option<String>,
+    // Missing on older records; those workspaces remain on the legacy shared VM.
+    #[serde(default)]
+    vm_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,7 +45,7 @@ struct LimaStatus {
 #[serde(rename_all = "camelCase")]
 struct VmStatus {
     state: String,
-    instance_name: &'static str,
+    instance_name: String,
     image_bytes: Option<u64>,
 }
 
@@ -52,6 +55,8 @@ struct VmProgress {
     phase: &'static str,
     message: String,
     downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
 }
 
 const POC_INSTANCE: &str = "orvex-poc";
@@ -222,7 +227,7 @@ fn validate_public_https_repo_url(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-fn run_limactl(home: &PathBuf, args: &[&str]) -> Result<std::process::Output, String> {
+fn run_limactl(home: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let executable = find_executable("limactl")
         .ok_or_else(|| "Lima is not installed. Install it before starting a VM.".to_owned())?;
     Command::new(executable)
@@ -259,7 +264,7 @@ fn send_stream_lines<R: Read + Send + 'static>(stream: R, sender: Sender<String>
     }
 }
 
-fn map_lima_progress(line: &str) -> Option<VmProgress> {
+fn map_lima_progress(line: &str, workspace_id: Option<&str>) -> Option<VmProgress> {
     let line = line.trim();
     let lower = line.to_ascii_lowercase();
     let (phase, message) = if lower.contains("attempting to download the image")
@@ -291,6 +296,7 @@ fn map_lima_progress(line: &str) -> Option<VmProgress> {
         phase,
         message: message.to_owned(),
         downloaded_bytes: None,
+        workspace_id: workspace_id.map(str::to_owned),
     })
 }
 
@@ -310,7 +316,12 @@ fn lima_download_temp(pid: u32) -> Option<PathBuf> {
     None
 }
 
-fn monitor_lima_download(app: AppHandle, pid: u32, stop: Arc<AtomicBool>) {
+fn monitor_lima_download(
+    app: AppHandle,
+    pid: u32,
+    stop: Arc<AtomicBool>,
+    workspace_id: Option<String>,
+) {
     let mut last_bytes = None;
     let mut temp_path = None;
     while !stop.load(Ordering::Relaxed) {
@@ -328,6 +339,7 @@ fn monitor_lima_download(app: AppHandle, pid: u32, stop: Arc<AtomicBool>) {
                         phase: "downloading",
                         message: "Downloading the Ubuntu Linux image…".into(),
                         downloaded_bytes: Some(bytes),
+                        workspace_id: workspace_id.clone(),
                     },
                 );
                 last_bytes = Some(bytes);
@@ -339,7 +351,12 @@ fn monitor_lima_download(app: AppHandle, pid: u32, stop: Arc<AtomicBool>) {
     }
 }
 
-fn run_limactl_with_progress(app: &AppHandle, home: &PathBuf, args: &[&str]) -> Result<(), String> {
+fn run_limactl_with_progress(
+    app: &AppHandle,
+    home: &PathBuf,
+    args: &[&str],
+    workspace_id: Option<&str>,
+) -> Result<(), String> {
     let executable = find_executable("limactl")
         .ok_or_else(|| "Lima is not installed. Install it before starting a VM.".to_owned())?;
     let mut child = Command::new(executable)
@@ -354,7 +371,8 @@ fn run_limactl_with_progress(app: &AppHandle, home: &PathBuf, args: &[&str]) -> 
         let stop = Arc::clone(&stop_monitor);
         let app = app.clone();
         let pid = child.id();
-        thread::spawn(move || monitor_lima_download(app, pid, stop))
+        let workspace_id = workspace_id.map(str::to_owned);
+        thread::spawn(move || monitor_lima_download(app, pid, stop, workspace_id))
     };
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -366,7 +384,7 @@ fn run_limactl_with_progress(app: &AppHandle, home: &PathBuf, args: &[&str]) -> 
     let stderr_reader = thread::spawn(move || send_stream_lines(stderr, sender));
     let mut recent_output = VecDeque::with_capacity(40);
     for line in receiver {
-        if let Some(progress) = map_lima_progress(&line) {
+        if let Some(progress) = map_lima_progress(&line, workspace_id) {
             let _ = app.emit("vm-start-progress", progress);
         }
         if recent_output.len() == 40 {
@@ -396,7 +414,7 @@ fn run_limactl_with_progress(app: &AppHandle, home: &PathBuf, args: &[&str]) -> 
     Ok(())
 }
 
-fn vm_state(home: &PathBuf) -> Result<String, String> {
+fn vm_state(home: &Path, instance_name: &str) -> Result<String, String> {
     let output = run_limactl(home, &["list", "--json"])?;
     if !output.status.success() {
         return Err(output_error(&output, "read VM status"));
@@ -405,7 +423,7 @@ fn vm_state(home: &PathBuf) -> Result<String, String> {
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
         let instance: serde_json::Value = serde_json::from_str(line)
             .map_err(|error| format!("Could not parse Lima status: {error}"))?;
-        if instance.get("name").and_then(|name| name.as_str()) == Some(POC_INSTANCE) {
+        if instance.get("name").and_then(|name| name.as_str()) == Some(instance_name) {
             return Ok(
                 match instance.get("status").and_then(|status| status.as_str()) {
                     Some("Running") => "running".to_owned(),
@@ -419,7 +437,7 @@ fn vm_state(home: &PathBuf) -> Result<String, String> {
     Ok("notCreated".to_owned())
 }
 
-fn guest_user(home: &Path) -> Result<(String, PathBuf, bool, u32, u32), String> {
+fn guest_user(home: &Path, instance_name: &str) -> Result<(String, PathBuf, bool), String> {
     let output = run_limactl(&home.to_path_buf(), &["list", "--json"])?;
     if !output.status.success() {
         return Err(output_error(&output, "read Linux user configuration"));
@@ -428,7 +446,7 @@ fn guest_user(home: &Path) -> Result<(String, PathBuf, bool, u32, u32), String> 
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
         let instance: serde_json::Value = serde_json::from_str(line)
             .map_err(|error| format!("Could not parse Lima instance configuration: {error}"))?;
-        if instance.get("name").and_then(|name| name.as_str()) != Some(POC_INSTANCE) {
+        if instance.get("name").and_then(|name| name.as_str()) != Some(instance_name) {
             continue;
         }
         let user = instance
@@ -447,25 +465,24 @@ fn guest_user(home: &Path) -> Result<(String, PathBuf, bool, u32, u32), String> 
             .get("passwordlessSudo")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let uid = user
-            .get("uid")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| "Lima does not report the guest user ID.".to_owned())?;
-        let gid = user
-            .get("gid")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| "Lima does not report the guest group ID.".to_owned())?;
         return Ok((
             name.to_owned(),
             PathBuf::from(guest_home),
             passwordless_sudo,
-            uid,
-            gid,
         ));
     }
     Err("The Orvex Linux VM has not been created.".into())
+}
+
+fn guest_identity_id(home: &Path, instance_name: &str, flag: &str) -> Result<u32, String> {
+    let output = run_limactl(home, &["shell", instance_name, "id", flag])?;
+    if !output.status.success() {
+        return Err(output_error(&output, "read the Linux guest identity"));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "The Linux guest returned an invalid user or group ID.".to_owned())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -487,28 +504,38 @@ fn open_workspace_terminal_blocking(
         return Err("The workspace identifier is invalid.".into());
     }
     let workspaces = read_workspaces(app)?;
-    if !workspaces.iter().any(|workspace| workspace.id == slug) {
-        return Err("That workspace is not in the Orvex workspace list.".into());
-    }
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.id == slug)
+        .ok_or_else(|| "That workspace is not in the Orvex workspace list.".to_owned())?;
 
     let home = app_lima_home(app)?;
-    if vm_state(&home)? != "running" {
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    if vm_state(&home, instance_name)? != "running" {
         return Err("Start the Linux VM before opening a workspace terminal.".into());
     }
-    let (guest_user, guest_home, passwordless_sudo, guest_uid, guest_gid) = guest_user(&home)?;
+    let (guest_user, guest_home, passwordless_sudo) = guest_user(&home, instance_name)?;
+    let (guest_uid, guest_gid) = if network_enabled {
+        (None, None)
+    } else {
+        (
+            Some(guest_identity_id(&home, instance_name, "-u")?),
+            Some(guest_identity_id(&home, instance_name, "-g")?),
+        )
+    };
     if !network_enabled && !passwordless_sudo {
         return Err(
             "Offline terminals need passwordless sudo to create a Linux network namespace.".into(),
         );
     }
-    if !network_enabled && (guest_uid == 0 || guest_gid == 0) {
+    if !network_enabled && (guest_uid == Some(0) || guest_gid == Some(0)) {
         return Err("Offline terminals need a non-root Lima guest user.".into());
     }
     let guest_path = guest_home.join("orvex/workspaces").join(&slug);
     let guest_path_text = guest_path.to_string_lossy().into_owned();
     let path_check = run_limactl(
         &home,
-        &["shell", POC_INSTANCE, "test", "-d", &guest_path_text],
+        &["shell", instance_name, "test", "-d", &guest_path_text],
     )?;
     if !path_check.status.success() {
         return Err(format!(
@@ -534,15 +561,17 @@ fn open_workspace_terminal_blocking(
             "exec {} shell --workdir {} {} bash -l\n",
             shell_quote(&limactl_text),
             shell_quote(&guest_path_text),
-            shell_quote(POC_INSTANCE),
+            shell_quote(instance_name),
         )
     } else {
+        let guest_uid = guest_uid.expect("offline terminal has a guest UID");
+        let guest_gid = guest_gid.expect("offline terminal has a guest GID");
         let guest_command = format!("cd {} && exec bash -l", shell_quote(&guest_path_text));
         format!(
             "exec {} shell --workdir {} {} sudo -n unshare --user --map-users=0:0:1 --map-users={guest_uid}:{guest_uid}:1 --map-groups=0:0:1 --map-groups={guest_gid}:{guest_gid}:1 --net --fork -- su -s /bin/bash -c {} {}\n",
             shell_quote(&limactl_text),
             shell_quote(&guest_path_text),
-            shell_quote(POC_INSTANCE),
+            shell_quote(instance_name),
             shell_quote(&guest_command),
             shell_quote(&guest_user),
         )
@@ -608,34 +637,45 @@ fn cached_lima_image_bytes() -> Option<u64> {
     newest.map(|(_, bytes)| bytes)
 }
 
-fn make_vm_status(state: String) -> VmStatus {
+fn make_vm_status(state: String, instance_name: &str) -> VmStatus {
     VmStatus {
         state,
-        instance_name: POC_INSTANCE,
+        instance_name: instance_name.to_owned(),
         image_bytes: cached_lima_image_bytes(),
     }
 }
 
-fn start_poc_vm_blocking(app: &AppHandle) -> Result<VmStatus, String> {
+fn start_instance_blocking(
+    app: &AppHandle,
+    instance_name: &str,
+    workspace_id: Option<&str>,
+) -> Result<VmStatus, String> {
     if !cfg!(target_os = "macos") {
-        return Err("The Lima VM proof of concept currently runs on macOS only.".into());
+        return Err("Lima virtual machines are currently supported on macOS only.".into());
     }
     let home = app_lima_home(app)?;
+    let state = vm_state(&home, instance_name)?;
     let _ = app.emit(
         "vm-start-progress",
         VmProgress {
             phase: "checking",
-            message: "Checking the VM and preparing its Linux image…".into(),
+            message: if state == "notCreated" {
+                "Preparing a dedicated Linux VM for this workspace…".into()
+            } else {
+                "Resuming this workspace's Linux VM…".into()
+            },
             downloaded_bytes: None,
+            workspace_id: workspace_id.map(str::to_owned),
         },
     );
-    if vm_state(&home)? == "notCreated" {
+    if state == "notCreated" {
+        let instance_arg = format!("--name={instance_name}");
         run_limactl_with_progress(
             app,
             &home,
             &[
                 "start",
-                "--name=orvex-poc",
+                &instance_arg,
                 "--vm-type=vz",
                 "--mount-none",
                 "--containerd=none",
@@ -645,24 +685,35 @@ fn start_poc_vm_blocking(app: &AppHandle) -> Result<VmStatus, String> {
                 "--progress",
                 "--yes",
             ],
+            workspace_id,
         )?;
-    } else if vm_state(&home)? != "running" {
-        run_limactl_with_progress(app, &home, &["start", POC_INSTANCE, "--progress", "--yes"])?;
+    } else if state != "running" {
+        run_limactl_with_progress(
+            app,
+            &home,
+            &["start", instance_name, "--progress", "--yes"],
+            workspace_id,
+        )?;
     }
     let _ = app.emit(
         "vm-start-progress",
         VmProgress {
             phase: "ready",
-            message: "Linux VM is ready.".into(),
+            message: "This workspace's Linux VM is ready.".into(),
             downloaded_bytes: None,
+            workspace_id: workspace_id.map(str::to_owned),
         },
     );
-    Ok(make_vm_status(vm_state(&home)?))
+    Ok(make_vm_status(vm_state(&home, instance_name)?, instance_name))
+}
+
+fn start_poc_vm_blocking(app: &AppHandle) -> Result<VmStatus, String> {
+    start_instance_blocking(app, POC_INSTANCE, None)
 }
 
 fn run_poc_check_blocking(app: &AppHandle) -> Result<String, String> {
     let home = app_lima_home(app)?;
-    if vm_state(&home)? != "running" {
+    if vm_state(&home, POC_INSTANCE)? != "running" {
         return Err("Start the Orvex VM before running the check.".into());
     }
     let output = run_limactl(&home, &["shell", POC_INSTANCE, "uname", "-a"])?;
@@ -672,27 +723,121 @@ fn run_poc_check_blocking(app: &AppHandle) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn stop_poc_vm_blocking(app: &AppHandle, delete: bool) -> Result<VmStatus, String> {
+fn stop_instance_blocking(
+    app: &AppHandle,
+    instance_name: &str,
+    delete: bool,
+) -> Result<VmStatus, String> {
     let home = app_lima_home(app)?;
-    let state = vm_state(&home)?;
+    let state = vm_state(&home, instance_name)?;
     if state == "notCreated" {
-        return Ok(make_vm_status(state));
+        return Ok(make_vm_status(state, instance_name));
     }
     if delete {
-        let output = run_limactl(&home, &["delete", "--force", POC_INSTANCE, "--yes"])?;
+        let output = run_limactl(&home, &["delete", "--force", instance_name, "--yes"])?;
         if !output.status.success() {
-            return Err(output_error(&output, "delete the Orvex VM"));
+            return Err(output_error(&output, "delete the workspace VM"));
         }
-        Ok(make_vm_status("notCreated".into()))
+        Ok(make_vm_status("notCreated".into(), instance_name))
     } else {
         if state == "running" {
-            let output = run_limactl(&home, &["stop", POC_INSTANCE, "--yes"])?;
+            let output = run_limactl(&home, &["stop", instance_name, "--yes"])?;
             if !output.status.success() {
-                return Err(output_error(&output, "stop the Orvex VM"));
+                return Err(output_error(&output, "stop the workspace VM"));
             }
         }
-        Ok(make_vm_status(vm_state(&home)?))
+        Ok(make_vm_status(vm_state(&home, instance_name)?, instance_name))
     }
+}
+
+fn stop_poc_vm_blocking(app: &AppHandle, delete: bool) -> Result<VmStatus, String> {
+    let status = stop_instance_blocking(app, POC_INSTANCE, delete)?;
+    if delete {
+        let mut workspaces = read_workspaces(app)?;
+        workspaces.retain(|workspace| workspace.vm_name.is_some());
+        write_workspaces(app, &workspaces)?;
+    }
+    Ok(status)
+}
+
+fn workspace_record(app: &AppHandle, workspace_id: &str) -> Result<Workspace, String> {
+    let slug = workspace_slug(workspace_id)?;
+    if slug != workspace_id {
+        return Err("The workspace identifier is invalid.".into());
+    }
+    read_workspaces(app)?
+        .into_iter()
+        .find(|workspace| workspace.id == slug)
+        .ok_or_else(|| "That workspace is not in the Orvex workspace list.".to_owned())
+}
+
+fn workspace_vm_status_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    let home = app_lima_home(app)?;
+    Ok(make_vm_status(vm_state(&home, instance_name)?, instance_name))
+}
+
+fn start_workspace_vm_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace
+        .vm_name
+        .as_deref()
+        .ok_or_else(|| "This older workspace uses the shared VM. Start it from the shared VM panel.".to_owned())?;
+    start_instance_blocking(app, instance_name, Some(workspace_id))
+}
+
+fn stop_workspace_vm_blocking(app: &AppHandle, workspace_id: &str) -> Result<VmStatus, String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace
+        .vm_name
+        .as_deref()
+        .ok_or_else(|| "This older workspace uses the shared VM. Stop it from the shared VM panel.".to_owned())?;
+    stop_instance_blocking(app, instance_name, false)
+}
+
+fn run_workspace_check_blocking(app: &AppHandle, workspace_id: &str) -> Result<String, String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace.vm_name.as_deref().unwrap_or(POC_INSTANCE);
+    let home = app_lima_home(app)?;
+    if vm_state(&home, instance_name)? != "running" {
+        return Err("Start this workspace's Linux VM before running the check.".into());
+    }
+    let output = run_limactl(&home, &["shell", instance_name, "uname", "-a"])?;
+    if !output.status.success() {
+        return Err(output_error(&output, "run the workspace Linux check"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn delete_workspace_blocking(app: &AppHandle, workspace_id: &str) -> Result<(), String> {
+    let workspace = workspace_record(app, workspace_id)?;
+    let instance_name = workspace
+        .vm_name
+        .as_deref()
+        .ok_or_else(|| "This older workspace shares a VM with other workspaces and cannot be deleted individually yet.".to_owned())?;
+    let _ = stop_instance_blocking(app, instance_name, true)?;
+    let mut workspaces = read_workspaces(app)?;
+    workspaces.retain(|item| item.id != workspace.id);
+    write_workspaces(app, &workspaces)
+}
+
+fn workspace_instance_name(slug: &str) -> String {
+    // Lima appends a long SSH socket filename to this directory. A compact,
+    // stable hash keeps the resulting Unix socket path below macOS's limit,
+    // even when the workspace name itself is long.
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    const HASH_SPACE: u64 = 2_821_109_907_456; // 36^8
+    let hash = slug.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    }) % HASH_SPACE;
+    let mut remaining = hash;
+    let mut encoded = [b'0'; 8];
+    for digit in encoded.iter_mut().rev() {
+        *digit = ALPHABET[(remaining % 36) as usize];
+        remaining /= 36;
+    }
+    format!("o{}", String::from_utf8_lossy(&encoded))
 }
 
 fn create_workspace_blocking(
@@ -707,38 +852,42 @@ fn create_workspace_blocking(
         .filter(|url| !url.trim().is_empty())
         .map(|url| validate_public_https_repo_url(&url))
         .transpose()?;
-    if repo_url.is_some() && !allow_network {
-        return Err("Approve network access to clone this repository.".into());
+    if !allow_network {
+        return Err("Approve internet access to download Linux and create this workspace VM.".into());
     }
     let mut workspaces = read_workspaces(app)?;
     if workspaces.iter().any(|workspace| workspace.id == slug) {
         return Err(format!("A workspace named “{name}” already exists."));
     }
 
+    let instance_name = workspace_instance_name(&slug);
+    let _ = start_instance_blocking(app, &instance_name, Some(&slug))?;
     let home = app_lima_home(app)?;
-    if vm_state(&home)? != "running" {
-        return Err("Start the Linux VM before creating a workspace.".into());
-    }
 
     const CREATE_WORKSPACE_SCRIPT: &str = r#"set -eu
 root="$HOME/orvex/workspaces"
+target="$root/$2"
 mkdir -p "$root"
-if [ -e "$root/$2" ]; then
+if [ -e "$target" ] || [ -L "$target" ]; then
   printf 'Workspace path already exists. Choose another name.\n' >&2
   exit 17
 fi
 if [ -n "$1" ]; then
-  GIT_TERMINAL_PROMPT=0 git clone --progress -- "$1" "$root/$2"
+  staging="$(mktemp -d "$root/.$2.orvex-clone.XXXXXX")"
+  rmdir "$staging"
+  trap 'rm -rf -- "$staging"' EXIT
+  GIT_TERMINAL_PROMPT=0 git clone --progress -- "$1" "$staging"
+  mv -- "$staging" "$target"
 else
-  mkdir "$root/$2"
-  printf '# Empty workspace\n\nCreated by Orvex.\n' > "$root/$2/README.md"
+  mkdir "$target"
+  printf '# Empty workspace\n\nCreated by Orvex.\n' > "$target/README.md"
 fi
 "#;
     let output = run_limactl(
         &home,
         &[
             "shell",
-            POC_INSTANCE,
+            &instance_name,
             "sh",
             "-c",
             CREATE_WORKSPACE_SCRIPT,
@@ -762,6 +911,7 @@ fi
         status: "Ready".into(),
         path: format!("~/orvex/workspaces/{slug}"),
         repo_url,
+        vm_name: Some(instance_name),
     };
     workspaces.push(workspace.clone());
     write_workspaces(app, &workspaces)?;
@@ -827,13 +977,68 @@ async fn install_lima() -> Result<LimaStatus, String> {
 async fn get_vm_status(app: AppHandle) -> Result<VmStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if find_executable("limactl").is_none() {
-            return Ok(make_vm_status("notCreated".into()));
+            return Ok(make_vm_status("notCreated".into(), POC_INSTANCE));
         }
         let home = app_lima_home(&app)?;
-        Ok(make_vm_status(vm_state(&home)?))
+        Ok(make_vm_status(vm_state(&home, POC_INSTANCE)?, POC_INSTANCE))
     })
     .await
     .map_err(|error| format!("VM status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_workspace_vm_status(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<VmStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_vm_status_blocking(&app, &workspace_id)
+    })
+    .await
+    .map_err(|error| format!("Workspace VM status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn start_workspace_vm(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<VmStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        start_workspace_vm_blocking(&app, &workspace_id)
+    })
+    .await
+    .map_err(|error| format!("Workspace VM start task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn stop_workspace_vm(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<VmStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_workspace_vm_blocking(&app, &workspace_id)
+    })
+    .await
+    .map_err(|error| format!("Workspace VM stop task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn run_workspace_check(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_workspace_check_blocking(&app, &workspace_id)
+    })
+    .await
+    .map_err(|error| format!("Workspace Linux check task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn delete_workspace(app: AppHandle, workspace_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_workspace_blocking(&app, &workspace_id))
+        .await
+        .map_err(|error| format!("Workspace deletion task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -876,6 +1081,11 @@ pub fn run() {
             get_lima_status,
             install_lima,
             get_vm_status,
+            get_workspace_vm_status,
+            start_workspace_vm,
+            stop_workspace_vm,
+            run_workspace_check,
+            delete_workspace,
             start_poc_vm,
             run_poc_check,
             stop_poc_vm,
