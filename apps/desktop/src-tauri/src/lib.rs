@@ -253,6 +253,7 @@ const AGENT_PROVIDERS: [AgentProvider; 6] = [
 const POC_INSTANCE: &str = "orvex-poc";
 
 fn find_executable(name: &str) -> Option<PathBuf> {
+    let executable_name = if cfg!(target_os = "windows") { format!("{name}.exe") } else { name.to_owned() };
     let candidates = if name == "limactl" {
         vec![
             PathBuf::from("/opt/homebrew/bin/limactl"),
@@ -271,7 +272,7 @@ fn find_executable(name: &str) -> Option<PathBuf> {
         .into_iter()
         .chain(std::env::var_os("PATH").into_iter().flat_map(|path| {
             std::env::split_paths(&path)
-                .map(|dir| dir.join(name))
+                .map(|dir| dir.join(&executable_name))
                 .collect::<Vec<_>>()
         }))
         .find(|path| path.is_file())
@@ -1632,6 +1633,7 @@ fn create_workspace_at(
     allow_unsupported_platform: bool,
     mut run: impl FnMut(&Path, &[&str], &str) -> Result<(), String>,
 ) -> Result<WorkspaceCreationResult, String> {
+    if !cfg!(target_os = "macos") { return Err("Workspace VM creation is not available in this Windows UI beta.".into()); }
     let name = name.trim().to_owned();
     let slug = workspace_slug(&name)?;
     if local_project.is_some() && (repo_url.is_some() || base_branch.is_some()) {

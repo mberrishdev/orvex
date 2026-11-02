@@ -138,7 +138,7 @@ pub(crate) fn status(data: &Path) -> Result<Status, String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

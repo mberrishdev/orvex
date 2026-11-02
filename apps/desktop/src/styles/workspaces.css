@@ -205,3 +205,7 @@ h1 { font-size: 31px; font-weight: 650; line-height: 1.2; letter-spacing: -1.2px
 .mcp-client small { color: #95959f; font-size: 9px; }
 .mcp-note { display: block; margin-top: 7px; color: #8c8c96; font-size: 9px; line-height: 1.6; }
 @media (max-width: 1000px) { .integration-grid { grid-template-columns: minmax(0, 1fr); } }
+
+.beta-notice { background: #dce6f080; border: 1px solid #aebed750; color: #4e607c; }
+.beta-notice strong { font-size: 12px; }
+.beta-notice p { margin: 5px 0 0; font-size: 11px; line-height: 1.7; }

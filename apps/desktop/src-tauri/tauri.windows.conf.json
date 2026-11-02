@@ -1,0 +1,16 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Orvex · Windows beta",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 760,
+        "minHeight": 620,
+        "titleBarStyle": "Visible",
+        "hiddenTitle": false,
+        "backgroundColor": "#F5F5F7"
+      }
+    ]
+  }
+}
