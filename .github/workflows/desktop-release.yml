@@ -119,6 +119,8 @@ jobs:
           NOTES
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release/* --clobber
+          elif [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release create "$RELEASE_TAG" release/* --verify-tag --prerelease --latest=false --title "Orvex $RELEASE_TAG" --notes-file /tmp/release-notes.txt
           else
-            gh release create "$RELEASE_TAG" release/* --verify-tag --prerelease --latest --title "Orvex $RELEASE_TAG" --notes-file /tmp/release-notes.txt
+            gh release create "$RELEASE_TAG" release/* --verify-tag --latest --title "Orvex $RELEASE_TAG" --notes-file /tmp/release-notes.txt
           fi
