@@ -209,3 +209,6 @@ h1 { font-size: 31px; font-weight: 650; line-height: 1.2; letter-spacing: -1.2px
 .beta-notice { background: #dce6f080; border: 1px solid #aebed750; color: #4e607c; }
 .beta-notice strong { font-size: 12px; }
 .beta-notice p { margin: 5px 0 0; font-size: 11px; line-height: 1.7; }
+.update-notice { margin: 0 0 18px; padding: 12px 14px; border-radius: 10px; }
+.update-notice .secondary-button { margin-top: 8px; }
+.update-error { display: block; margin: -10px 0 18px; }

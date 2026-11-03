@@ -2373,6 +2373,7 @@ async fn delete_poc_vm(app: AppHandle) -> Result<VmStatus, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             get_mcp_status,

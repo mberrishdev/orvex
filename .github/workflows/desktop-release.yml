@@ -1,0 +1,124 @@
+name: Desktop release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos
+            bundles: dmg
+          - os: windows-2022
+            platform: windows
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build frontend assets for Rust tests
+        run: pnpm --filter @orvex/desktop build
+      - name: Test shared Rust code
+        run: cargo test --locked --workspace --lib --features custom-protocol
+      - name: Build installer
+        run: pnpm --filter @orvex/desktop tauri build --bundles ${{ matrix.bundles }} --features custom-protocol
+      - name: Collect signed updater artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            find target/release/bundle/nsis -type f -exec cp {} release/ \;
+          else
+            find target/release/bundle/macos target/release/bundle/dmg -type f -exec cp {} release/ \;
+          fi
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            archive=$(find release -type f -name '*.nsis.zip' | head -n 1)
+            platform_key=windows-x86_64
+          else
+            archive=$(find release -type f -name '*.app.tar.gz' | head -n 1)
+            platform_key=darwin-aarch64
+          fi
+          test -n "$archive" && test -f "$archive.sig"
+          version=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
+          jq -n \
+            --arg version "$version" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg platform "$platform_key" \
+            --arg signature "$(cat "$archive.sig")" \
+            --arg url "https://github.com/mberrishdev/orvex/releases/download/${RELEASE_TAG}/$(basename "$archive")" \
+            '{version: $version, notes: "", pub_date: $pub_date, platforms: {($platform): {signature: $signature, url: $url}}}' \
+            > release/latest-${{ matrix.platform }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: artifacts
+          merge-multiple: false
+      - name: Assemble updater manifest and checksums
+        shell: bash
+        run: |
+          mkdir -p release manifests
+          find artifacts -name 'latest-*.json' -exec cp {} manifests/ \;
+          jq -s 'reduce .[] as $item ({}; .version = $item.version | .notes = $item.notes | .pub_date = $item.pub_date | .platforms = ((.platforms // {}) + $item.platforms))' manifests/latest-*.json > release/latest.json
+          find artifacts -type f ! -name 'latest-*.json' -exec cp {} release/ \;
+          find release -type f ! -name 'latest.json' -print0 | sort -z | xargs -0 sha256sum > release/SHA256SUMS.txt
+      - name: Publish desktop release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cat > /tmp/release-notes.txt <<'NOTES'
+          Signed macOS and Windows desktop release.
+
+          Orvex checks this GitHub release for updates and installs signed updates in-app.
+          NOTES
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* --verify-tag --prerelease --latest --title "Orvex $RELEASE_TAG" --notes-file /tmp/release-notes.txt
+          fi

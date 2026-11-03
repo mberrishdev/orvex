@@ -18,6 +18,10 @@ pnpm dev
 
 `pnpm dev` launches the Tauri desktop application. `pnpm build` checks and builds the frontend; `pnpm check:rust` checks the Rust workspace.
 
+## Desktop updates
+
+The macOS Apple Silicon and Windows x64 builds check the latest GitHub release and can install signed updates in-app. Release builds require the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and, when the key is password-protected, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Generate the key pair with `pnpm --filter @orvex/desktop exec tauri signer generate`; keep the private key only in GitHub Actions secrets and place the generated `.pub` value in `apps/desktop/src-tauri/tauri.conf.json`.
+
 ## Current capabilities
 
 On macOS, each newly created workspace gets its own Lima Linux VM, and its terminal and VM lifecycle are managed independently. Creating a workspace downloads/prepares Ubuntu and leaves that VM with internet access after an explicit confirmation. The default terminal starts in a Linux network namespace without a usable route; opening a terminal with the VM's network access requires confirmation.
