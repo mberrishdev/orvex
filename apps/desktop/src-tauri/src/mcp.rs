@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 
 fn controller() -> Result<WorkspaceController, String> {
-    if !cfg!(target_os = "macos") {
-        return Err("Workspace runtime currently requires macOS and Lima.".into());
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        return Err("Workspace runtime requires macOS or Windows.".into());
     }
     Ok(WorkspaceController::new(crate::cli_app_data_dir()?))
 }

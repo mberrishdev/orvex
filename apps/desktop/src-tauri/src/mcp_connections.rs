@@ -31,6 +31,16 @@ pub(crate) struct Status {
 pub(crate) struct Connection(PathBuf);
 
 fn identity(pid: u32) -> Result<String, String> {
+    #[cfg(windows)]
+    let output = {
+        use std::os::windows::process::CommandExt;
+        Command::new("powershell.exe")
+            .creation_flags(0x08000000)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                &format!("$ErrorActionPreference='Stop'; (Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks")])
+            .output().map_err(|e| e.to_string())?
+    };
+    #[cfg(not(windows))]
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .output()
@@ -138,7 +148,7 @@ pub(crate) fn status(data: &Path) -> Result<Status, String> {
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;

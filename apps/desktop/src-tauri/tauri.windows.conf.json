@@ -2,7 +2,7 @@
   "app": {
     "windows": [
       {
-        "title": "Orvex · Windows beta",
+        "title": "Orvex · Workspaces",
         "width": 1180,
         "height": 780,
         "minWidth": 760,
