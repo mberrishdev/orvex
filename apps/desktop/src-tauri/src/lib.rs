@@ -463,7 +463,7 @@ fn output_error(output: &std::process::Output, action: &str) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let details = if stderr.is_empty() { stdout } else { stderr };
     if details.is_empty() {
-        format!("Could not {action}: Lima exited with {}.", output.status)
+        format!("Could not {action}: the workspace runtime exited with {}.", output.status)
     } else {
         format!("Could not {action}: {details}")
     }
@@ -651,7 +651,7 @@ fn vm_state(home: &Path, instance_name: &str) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
         let instance: serde_json::Value = serde_json::from_str(line)
-            .map_err(|error| format!("Could not parse Lima status: {error}"))?;
+            .map_err(|error| format!("Could not parse workspace runtime status: {error}"))?;
         if instance.get("name").and_then(|name| name.as_str()) == Some(instance_name) {
             return Ok(
                 match instance.get("status").and_then(|status| status.as_str()) {
@@ -674,22 +674,22 @@ fn guest_user(home: &Path, instance_name: &str) -> Result<(String, PathBuf, bool
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
         let instance: serde_json::Value = serde_json::from_str(line)
-            .map_err(|error| format!("Could not parse Lima instance configuration: {error}"))?;
+            .map_err(|error| format!("Could not parse Linux workspace configuration: {error}"))?;
         if instance.get("name").and_then(|name| name.as_str()) != Some(instance_name) {
             continue;
         }
         let user = instance
             .get("config")
             .and_then(|config| config.get("user"))
-            .ok_or_else(|| "Lima does not report the guest user configuration.".to_owned())?;
+            .ok_or_else(|| "The workspace runtime did not report its Linux user configuration.".to_owned())?;
         let name = user
             .get("name")
             .and_then(|name| name.as_str())
-            .ok_or_else(|| "Lima does not report the guest user name.".to_owned())?;
+            .ok_or_else(|| "The workspace runtime did not report its Linux user name.".to_owned())?;
         let guest_home = user
             .get("home")
             .and_then(|path| path.as_str())
-            .ok_or_else(|| "Lima does not report the guest home directory.".to_owned())?;
+            .ok_or_else(|| "The workspace runtime did not report its Linux home directory.".to_owned())?;
         let passwordless_sudo = user
             .get("passwordlessSudo")
             .and_then(|value| value.as_bool())
@@ -763,7 +763,7 @@ fn open_workspace_terminal_blocking(
         );
     }
     if !network_enabled && (guest_uid == Some(0) || guest_gid == Some(0)) {
-        return Err("Offline terminals need a non-root Lima guest user.".into());
+        return Err("Offline terminals need a non-root Linux user.".into());
     }
     let guest_path = guest_home.join("orvex/workspaces").join(&slug);
     let guest_path_text = guest_path.to_string_lossy().replace('\\', "/");
@@ -2107,7 +2107,7 @@ fn cli_workspace_vm_action(workspace_id: &str, start: bool, network: bool) -> Re
 fn cli_workspace_exec(workspace_id: &str, network: bool, command: &[String]) -> Result<i32, String> {
     let controller = workspace_controller::WorkspaceController::new(cli_app_data_dir()?);
     let status = controller.command(workspace_id, network, command)?.status()
-        .map_err(|error| format!("Could not start the Lima command: {error}"))?;
+        .map_err(|error| format!("Could not start the workspace command: {error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -2148,7 +2148,7 @@ fn workspace_command(controller: &workspace_controller::WorkspaceController, wor
         let uid = guest_identity_id(&lima_home, &instance_name, "-u")?;
         let gid = guest_identity_id(&lima_home, &instance_name, "-g")?;
         if uid == 0 || gid == 0 {
-            return Err("Offline command execution needs a non-root Lima guest user.".into());
+            return Err("Offline command execution needs a non-root Linux user.".into());
         }
         let command_text = command.iter().map(|part| shell_quote(part)).collect::<Vec<_>>().join(" ");
         let guest_command = format!("cd {} && exec {command_text}", shell_quote(&guest_path_text));

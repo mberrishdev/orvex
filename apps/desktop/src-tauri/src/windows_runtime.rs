@@ -43,23 +43,35 @@ fn management_text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
     }
 }
-fn checked(mut command: Command) -> Result<Output, String> {
+fn command_error(output: &Output, action: &str) -> String {
+    let details = [
+        management_text(&output.stderr),
+        management_text(&output.stdout),
+    ]
+    .into_iter()
+    .map(|text| text.trim().to_owned())
+    .filter(|text| !text.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n");
+    if details.is_empty() {
+        format!("Could not {action}: process exited with {}.", output.status)
+    } else {
+        format!("Could not {action}: {details}")
+    }
+}
+fn checked(mut command: Command, action: &str) -> Result<Output, String> {
     let output = command
         .output()
-        .map_err(|e| format!("Could not run WSL: {e}"))?;
+        .map_err(|e| format!("Could not {action}: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "WSL failed: {} {}",
-            management_text(&output.stderr).trim(),
-            management_text(&output.stdout).trim()
-        ));
+        return Err(command_error(&output, action));
     }
     Ok(output)
 }
 fn management(args: &[&str]) -> Result<Output, String> {
     let mut cmd = command()?;
     cmd.args(args);
-    checked(cmd)
+    checked(cmd, "run WSL")
 }
 pub(crate) fn version() -> Result<String, String> {
     let version = management(&["--version"])?;
@@ -131,7 +143,7 @@ fn root(instance: &str, script: &str) -> Result<Output, String> {
         "-c",
         script,
     ]);
-    checked(cmd)
+    checked(cmd, "configure the Linux workspace")
 }
 
 fn create(home: &Path, instance: &str) -> Result<Output, String> {
@@ -163,14 +175,14 @@ fn create(home: &Path, instance: &str) -> Result<Output, String> {
         .env("ORVEX_IMAGE_PATH", &image)
         .env("ORVEX_IMAGE_HASH", IMAGE_SHA256);
     download.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &format!(r#"$ErrorActionPreference='Stop'; Invoke-WebRequest -UseBasicParsing -TimeoutSec 600 -Uri 'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/{IMAGE}' -OutFile $env:ORVEX_IMAGE_PATH; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $env:ORVEX_IMAGE_PATH).Hash -ne $env:ORVEX_IMAGE_HASH) {{ throw 'Ubuntu image checksum mismatch' }}"#)]);
-    checked(download)?;
+    checked(download, "download and verify the Ubuntu image")?;
     let mut import = command()?;
     import
         .args(["--import", instance])
         .arg(directory.join("disk"))
         .arg(&image)
         .args(["--version", "2"]);
-    checked(import)?;
+    checked(import, "import the Ubuntu distribution")?;
     let _ = std::fs::remove_file(image);
     root(instance, PROVISION)?;
     management(&["--terminate", instance])?;
@@ -203,7 +215,7 @@ fn start(home: &Path, instance: &str) -> Result<Output, String> {
         "-c",
         "nohup sleep infinity >/dev/null 2>&1 </dev/null &",
     ]);
-    checked(cmd)
+    checked(cmd, "start the Linux workspace")
 }
 
 /// Translate the shared controller's lifecycle/shell/copy operations to WSL.
@@ -259,11 +271,11 @@ pub(crate) fn run(home: &Path, args: &[&str]) -> Result<Output, String> {
             cmd.stdin(Stdio::from(
                 std::fs::File::open(source).map_err(|e| e.to_string())?,
             ));
-            checked(cmd)
+            checked(cmd, "transfer the project snapshot")
         }
         _ => Err(format!(
-            "Unsupported WSL runtime operation: {:?}",
-            args.first()
+            "Unsupported WSL runtime operation: {}.",
+            args.first().copied().unwrap_or("missing operation")
         )),
     }
 }
@@ -271,6 +283,32 @@ pub(crate) fn run(home: &Path, args: &[&str]) -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_commands_report_the_action_and_include_an_exit_status_when_output_is_empty() {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(256)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1)
+        };
+        let mut output = Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let message = command_error(&output, "download Ubuntu");
+        assert!(message.contains("download Ubuntu"));
+        assert!(message.contains("exited with"));
+        output.stderr = b"checksum mismatch\r\n".to_vec();
+        assert_eq!(
+            command_error(&output, "verify Ubuntu"),
+            "Could not verify Ubuntu: checksum mismatch"
+        );
+    }
     #[test]
     fn decodes_wsl_management_output_without_changing_guest_output() {
         let utf16 = "Ubuntu\r\norvex-test\r\n"

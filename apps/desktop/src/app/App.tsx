@@ -358,7 +358,7 @@ function App() {
 
   async function openWorkspaceTerminal(workspace: Workspace, networkEnabled: boolean) {
     if (networkEnabled && !window.confirm(
-      `Open a terminal for “${workspace.name}” with the Linux VM's current network access?\n\nThis allows the shell and commands it starts to access the internet and reachable host or LAN services.`,
+      `Open a terminal for “${workspace.name}” with the workspace's current network access?\n\nThis allows the shell and commands it starts to access the internet and reachable host or LAN services.`,
     )) return;
     setTerminalAction(`${workspace.id}:${networkEnabled ? "online" : "offline"}`);
     setTerminalError(null);
@@ -373,7 +373,7 @@ function App() {
 
   async function runWorkspaceServices(workspace: Workspace, action: "start" | "stop" | "status" | "logs") {
     if (action === "start" && !window.confirm(
-      `Install Docker in “${workspace.name}” if needed, then start ${workspace.composeFile ?? "the Compose services"}?\n\nThis may download images and run project containers with the VM's current internet access. The Docker daemon has elevated access inside this workspace VM. Services are reachable from this computer at the Linux runtime address.`,
+      `Install Docker in “${workspace.name}” if needed, then start ${workspace.composeFile ?? "the Compose services"}?\n\nThis may download images and run project containers with the workspace's current internet access. The Docker daemon has elevated access inside this workspace. Services are reachable from this computer at the Linux runtime address.`,
     )) return;
     const key = `${workspace.id}:${action}`;
     setWorkspaceServiceAction(key);
@@ -560,7 +560,7 @@ function App() {
                 : <button className="danger-button" disabled title="This workspace shares the legacy VM with other workspaces. Delete the shared VM to remove all legacy workspaces together.">Delete workspace</button>}
             </div>
             {isLegacy && legacyWorkspaceCount > 1 && <small className="runtime-feedback-error">This workspace shares a VM with {legacyWorkspaceCount - 1} others. Delete the shared VM to remove legacy workspaces together.</small>}
-            {!isLegacy && workspaceVmAction === `${w.id}:start` && <small className="runtime-feedback">{workspaceVmProgress[w.id]?.message ?? "Starting this workspace's VM…"}</small>}
+            {!isLegacy && workspaceVmAction === `${w.id}:start` && <small className="runtime-feedback">{workspaceVmProgress[w.id]?.message ?? "Starting this workspace…"}</small>}
             <div className="workspace-terminal-actions"><button className="secondary-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, false)}>{terminalAction === `${w.id}:offline` ? "Opening…" : "Open Terminal"}</button><button className="network-terminal-button" disabled={state !== "running" || terminalAction !== null || (isLegacy && vm?.state !== "running")} onClick={() => void openWorkspaceTerminal(w, true)}>{terminalAction === `${w.id}:online` ? "Opening…" : "Open with network"}</button></div>
           </div>
           {!isLegacy && w.agentProviders.length > 0 && <details className="workspace-agent-readiness" aria-label={`Coding CLI readiness for ${w.name}`}>
@@ -665,7 +665,7 @@ function App() {
           I approve downloading Linux, installing project dependencies, running declared setup commands, and giving this workspace internet access{repoUrl.trim() ? ", including cloning this repository" : ""}.
         </label>
         <div className="workspace-dialog-note needs-vm">This approval enables the workspace's network; Orvex does not yet enforce a workspace firewall. It can remain online after creation.</div>
-        {workspaceCreating && <div className="vm-progress" role="status" aria-live="polite"><div className="vm-progress-current"><span className="spinner"/><div><strong>{workspaceVmProgress[workspaceSlugPreview(workspaceName)]?.message ?? "Creating the dedicated Linux VM…"}</strong><small>First creation downloads and prepares Ubuntu.</small></div></div></div>}
+        {workspaceCreating && <div className="vm-progress" role="status" aria-live="polite"><div className="vm-progress-current"><span className="spinner"/><div><strong>{workspaceVmProgress[workspaceSlugPreview(workspaceName)]?.message ?? "Creating the Linux workspace…"}</strong><small>First creation downloads and prepares Ubuntu.</small></div></div></div>}
         {workspaceError && <div className="vm-error" role="alert">{workspaceError}</div>}
         <div className="vm-actions workspace-dialog-actions">
           <button type="button" className="secondary-button" disabled={workspaceCreating} onClick={() => setWorkspaceDialogOpen(false)}>Cancel</button>
