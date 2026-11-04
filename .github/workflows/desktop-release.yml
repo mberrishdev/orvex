@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-release-${{ inputs.tag || github.ref }}
+  group: desktop-release
   cancel-in-progress: false
 
 jobs:
@@ -25,7 +25,7 @@ jobs:
         include:
           - os: macos-14
             platform: macos
-            bundles: dmg
+            bundles: app,dmg
           - os: windows-2022
             platform: windows
             bundles: nsis
@@ -46,8 +46,21 @@ jobs:
           node-version: '22'
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require updater signing key
+        shell: bash
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
+      - name: Validate release version and configure update channel
+        shell: bash
+        run: python scripts/release-artifacts.py prepare --tag "$RELEASE_TAG"
+      - name: Test release artifact validation
+        run: python scripts/test-release-artifacts.py
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Test desktop update flow
+        run: pnpm --filter @orvex/desktop test:updates
       - name: Build frontend assets for Rust tests
         run: pnpm --filter @orvex/desktop build
       - name: Test shared Rust code
@@ -56,30 +69,7 @@ jobs:
         run: pnpm --filter @orvex/desktop tauri build --bundles ${{ matrix.bundles }} --features custom-protocol
       - name: Collect signed updater artifacts
         shell: bash
-        run: |
-          mkdir -p release
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            find target/release/bundle/nsis -type f -exec cp {} release/ \;
-          else
-            find target/release/bundle/macos target/release/bundle/dmg -type f -exec cp {} release/ \;
-          fi
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            archive=$(find release -type f -name '*.nsis.zip' | head -n 1)
-            platform_key=windows-x86_64
-          else
-            archive=$(find release -type f -name '*.app.tar.gz' | head -n 1)
-            platform_key=darwin-aarch64
-          fi
-          test -n "$archive" && test -f "$archive.sig"
-          version=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
-          jq -n \
-            --arg version "$version" \
-            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg platform "$platform_key" \
-            --arg signature "$(cat "$archive.sig")" \
-            --arg url "https://github.com/mberrishdev/orvex/releases/download/${RELEASE_TAG}/$(basename "$archive")" \
-            '{version: $version, notes: "", pub_date: $pub_date, platforms: {($platform): {signature: $signature, url: $url}}}' \
-            > release/latest-${{ matrix.platform }}.json
+        run: python scripts/release-artifacts.py collect --platform "${{ matrix.platform }}" --tag "$RELEASE_TAG"
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.platform }}
@@ -93,19 +83,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           pattern: desktop-*
           path: artifacts
           merge-multiple: false
       - name: Assemble updater manifest and checksums
-        shell: bash
-        run: |
-          mkdir -p release manifests
-          find artifacts -name 'latest-*.json' -exec cp {} manifests/ \;
-          jq -s 'reduce .[] as $item ({}; .version = $item.version | .notes = $item.notes | .pub_date = $item.pub_date | .platforms = ((.platforms // {}) + $item.platforms))' manifests/latest-*.json > release/latest.json
-          find artifacts -type f ! -name 'latest-*.json' -exec cp {} release/ \;
-          find release -type f ! -name 'latest.json' -print0 | sort -z | xargs -0 sha256sum > release/SHA256SUMS.txt
+        run: python3 scripts/release-artifacts.py merge
       - name: Publish desktop release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,7 +102,10 @@ jobs:
           cat > /tmp/release-notes.txt <<'NOTES'
           Signed macOS and Windows desktop release.
 
-          Orvex checks this GitHub release for updates and installs signed updates in-app.
+          Orvex checks for signed updates automatically. You can also check from App updates.
+          Install this updater-enabled version once manually to receive future updates.
+          macOS: Apple Silicon. Windows: x64. Windows runtime support remains experimental.
+          Updater signatures verify downloads; OS code signing/notarization is not configured.
           NOTES
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release/* --clobber
@@ -124,3 +114,9 @@ jobs:
           else
             gh release create "$RELEASE_TAG" release/* --verify-tag --latest --title "Orvex $RELEASE_TAG" --notes-file /tmp/release-notes.txt
           fi
+          # Beta clients also graduate to stable releases through this feed.
+          # Never publish a partial manifest while either platform is still building.
+          if ! gh release view updater-beta >/dev/null 2>&1; then
+            gh release create updater-beta --target "$GITHUB_SHA" --prerelease --latest=false --title "Beta update feed" --notes "Machine-readable update feed. Install from a versioned Orvex release."
+          fi
+          gh release upload updater-beta release/latest.json --clobber

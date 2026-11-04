@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { check } from "@tauri-apps/plugin-updater";
+import { AppUpdates } from "../features/updates/AppUpdates";
 import "../styles/workspaces.css";
 import { Sidebar } from "../features/workspaces/Sidebar";
 import { McpStatus } from "../features/workspaces/McpStatus";
@@ -75,46 +75,8 @@ function App() {
   const [runtimeMessage, setRuntimeMessage] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [availableUpdate, setAvailableUpdate] = useState<string | null>(null);
-  const [updateAction, setUpdateAction] = useState<"checking" | "installing" | null>(null);
-  const [updateError, setUpdateError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshInFlight = useRef(false);
-
-  useEffect(() => {
-    if (import.meta.env.DEV) return;
-    let disposed = false;
-    setUpdateAction("checking");
-    void check()
-      .then((update) => {
-        if (!disposed && update) setAvailableUpdate(update.version);
-      })
-      .catch((reason: unknown) => {
-        if (!disposed) setUpdateError(`Update check failed: ${String(reason)}`);
-      })
-      .finally(() => {
-        if (!disposed) setUpdateAction(null);
-      });
-    return () => { disposed = true; };
-  }, []);
-
-  async function installUpdate() {
-    setUpdateAction("installing");
-    setUpdateError(null);
-    try {
-      const update = await check();
-      if (!update) {
-        setAvailableUpdate(null);
-        return;
-      }
-      await update.downloadAndInstall();
-      setAvailableUpdate(null);
-    } catch (reason) {
-      setUpdateError(`Update installation failed: ${String(reason)}`);
-    } finally {
-      setUpdateAction(null);
-    }
-  }
 
   async function refreshWorkspaces() {
     if (refreshInFlight.current) return;
@@ -617,12 +579,7 @@ function App() {
           {workspaceSetupErrors[w.id] && <small className="workspace-setup-result workspace-setup-failed">Setup config: {workspaceSetupErrors[w.id]}</small>}
         </article>;
       })}</div>}
-      {availableUpdate && <div className="beta-notice update-notice" role="status">
-        <strong>Orvex {availableUpdate} is available.</strong>
-        <p>Install the update from the GitHub release without leaving the app.</p>
-        <button className="secondary-button" disabled={updateAction !== null} onClick={() => void installUpdate()}>{updateAction === "installing" ? "Installing…" : "Install update"}</button>
-      </div>}
-      {updateError && <small className="runtime-feedback-error update-error" role="alert">{updateError}</small>}
+      <AppUpdates busy={workspaceCreating || workspaceDeleting !== null || workspaceVmAction !== null || vmAction !== null || workspaceServiceAction !== null || installing} />
       <footer className="footer"><span>Made for a little more focus.</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
     <dialog ref={deleteDialogRef} className="workspace-dialog workspace-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-workspace-title" aria-describedby="delete-workspace-description" onCancel={(event) => { event.preventDefault(); if (workspaceDeleting === null) setPendingWorkspaceDelete(null); }}>

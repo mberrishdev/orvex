@@ -212,3 +212,9 @@ h1 { font-size: 31px; font-weight: 650; line-height: 1.2; letter-spacing: -1.2px
 .update-notice { margin: 0 0 18px; padding: 12px 14px; border-radius: 10px; }
 .update-notice .secondary-button { margin-top: 8px; }
 .update-error { display: block; margin: -10px 0 18px; }
+
+.app-updates { margin-top: 24px; padding: 16px 18px; border: 1px solid var(--line, #dedee3); border-radius: 16px; background: rgba(255,255,255,.55); font-size: 13px; }
+.app-update-row { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
+.app-updates small { display: block; margin-top: 10px; color: #686873; line-height: 1.5; }
+.app-updates progress { display: block; width: 100%; height: 6px; margin-top: 12px; accent-color: #242428; }
+.app-updates p { margin-bottom: 0; overflow-wrap: anywhere; }
