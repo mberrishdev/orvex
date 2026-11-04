@@ -125,7 +125,7 @@ pub(crate) fn guest(home: &Path, instance: &str, id: &str) -> Result<Requirement
         .join("orvex/workspaces")
         .join(id)
         .to_string_lossy()
-        .into_owned();
+        .replace('\\', "/");
     inspect(
         |args| {
             let mut argv = vec!["shell", instance, "git", "-C", root.as_str()];

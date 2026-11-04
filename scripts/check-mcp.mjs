@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
 
-const binary = resolve(process.env.ORVEX_TEST_BINARY ?? 'target/debug/orvex');
+const binary = resolve(process.env.ORVEX_TEST_BINARY ?? (process.platform === 'win32' ? 'target/debug/orvex.exe' : 'target/debug/orvex'));
 const args = process.argv.slice(2);
 if (args.length && (args.length !== 2 || args[0] !== '--workspace')) {
   throw new Error('Usage: pnpm check:mcp [--workspace <running-workspace-id>]');
