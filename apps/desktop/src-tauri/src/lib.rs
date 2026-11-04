@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod windows_runtime;
 mod mcp_connections;
 mod environment_plan;
 mod project_configuration;
@@ -279,6 +281,11 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 }
 
 fn inspect_lima() -> LimaStatus {
+    #[cfg(windows)]
+    {
+        let version = windows_runtime::version().ok();
+        return LimaStatus { installed: version.is_some(), version, install_supported: false, installer: None };
+    }
     let executable = find_executable("limactl");
     let version = executable.as_ref().and_then(|path| {
         Command::new(path)
@@ -437,6 +444,10 @@ fn validate_public_https_repo_url(value: &str) -> Result<String, String> {
 }
 
 fn run_limactl(home: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    #[cfg(windows)]
+    return windows_runtime::run(home, args);
+    #[cfg(not(windows))]
+    {
     let executable = find_executable("limactl")
         .ok_or_else(|| "Lima is not installed. Install it before starting a VM.".to_owned())?;
     Command::new(executable)
@@ -444,6 +455,7 @@ fn run_limactl(home: &Path, args: &[&str]) -> Result<std::process::Output, Strin
         .args(args)
         .output()
         .map_err(|error| format!("Could not run Lima: {error}"))
+    }
 }
 
 fn output_error(output: &std::process::Output, action: &str) -> String {
@@ -566,6 +578,14 @@ fn run_limactl_with_progress(
     args: &[&str],
     workspace_id: Option<&str>,
 ) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _ = app.emit("vm-start-progress", VmProgress { phase: "preparing",
+            message: "Preparing the WSL workspace. First creation downloads Ubuntu and installs Linux tools…".into(),
+            downloaded_bytes: None, workspace_id: workspace_id.map(str::to_owned) });
+        let output = windows_runtime::run(home, args)?;
+        return if output.status.success() { Ok(()) } else { Err(output_error(&output, "prepare WSL workspace")) };
+    }
     let executable = find_executable("limactl")
         .ok_or_else(|| "Lima is not installed. Install it before starting a VM.".to_owned())?;
     let mut child = Command::new(executable)
@@ -703,10 +723,15 @@ fn open_workspace_terminal_blocking(
     workspace_id: String,
     network_enabled: bool,
 ) -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Err(
-            "Opening a Lima workspace terminal is currently supported on macOS only.".into(),
-        );
+    #[cfg(windows)]
+    {
+        let directory = app.path().app_data_dir().map_err(|e|e.to_string())?;
+        let controller = workspace_controller::WorkspaceController::new(directory);
+        let mut cmd = controller.command(&workspace_id, network_enabled, &["bash".into(), "-l".into()])?;
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x00000010); // CREATE_NEW_CONSOLE, independent interactive terminal.
+        cmd.spawn().map_err(|e|format!("Could not open WSL terminal: {e}"))?;
+        return Ok(());
     }
     let slug = workspace_slug(&workspace_id)?;
     if slug != workspace_id {
@@ -741,7 +766,7 @@ fn open_workspace_terminal_blocking(
         return Err("Offline terminals need a non-root Lima guest user.".into());
     }
     let guest_path = guest_home.join("orvex/workspaces").join(&slug);
-    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let guest_path_text = guest_path.to_string_lossy().replace('\\', "/");
     let path_check = run_limactl(
         &home,
         &["shell", instance_name, "test", "-d", &guest_path_text],
@@ -859,8 +884,8 @@ fn start_instance_blocking(
     instance_name: &str,
     workspace_id: Option<&str>,
 ) -> Result<VmStatus, String> {
-    if !cfg!(target_os = "macos") {
-        return Err("Lima virtual machines are currently supported on macOS only.".into());
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        return Err("Workspace runtimes require macOS or Windows.".into());
     }
     let home = app_lima_home(app)?;
     let state = vm_state(&home, instance_name)?;
@@ -1445,7 +1470,7 @@ fn check_agent_in_workspace(
 
     let (_, guest_home, _) = guest_user(home, instance_name)?;
     let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
-    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let guest_path_text = guest_path.to_string_lossy().replace('\\', "/");
     let script = format!(
         "export PATH=\"$HOME/.local/bin:$PATH\"; if command -v {0} >/dev/null 2>&1; then {0} --version; else exit 127; fi",
         provider.executable
@@ -1605,7 +1630,11 @@ fn workspace_instance_name(slug: &str) -> String {
         *digit = ALPHABET[(remaining % 36) as usize];
         remaining /= 36;
     }
-    format!("o{}", String::from_utf8_lossy(&encoded))
+    if cfg!(windows) {
+        format!("orvex-{}", String::from_utf8_lossy(&encoded))
+    } else {
+        format!("o{}", String::from_utf8_lossy(&encoded))
+    }
 }
 
 fn create_workspace_blocking(
@@ -1633,7 +1662,7 @@ fn create_workspace_at(
     allow_unsupported_platform: bool,
     mut run: impl FnMut(&Path, &[&str], &str) -> Result<(), String>,
 ) -> Result<WorkspaceCreationResult, String> {
-    if !cfg!(target_os = "macos") { return Err("Workspace VM creation is not available in this Windows UI beta.".into()); }
+    if !cfg!(any(target_os = "macos", target_os = "windows")) { return Err("Workspace runtimes require macOS or Windows.".into()); }
     let name = name.trim().to_owned();
     let slug = workspace_slug(&name)?;
     if local_project.is_some() && (repo_url.is_some() || base_branch.is_some()) {
@@ -2095,15 +2124,21 @@ fn workspace_command(controller: &workspace_controller::WorkspaceController, wor
     }
     let (guest_user, guest_home, passwordless_sudo) = guest_user(&lima_home, &instance_name)?;
     let guest_path = guest_home.join("orvex/workspaces").join(&workspace.id);
-    let guest_path_text = guest_path.to_string_lossy().into_owned();
+    let guest_path_text = guest_path.to_string_lossy().replace('\\', "/");
     let path_check = run_limactl(&lima_home, &["shell", &instance_name, "test", "-d", &guest_path_text])?;
     if !path_check.status.success() {
         return Err(format!("Workspace folder was not found in Linux: {guest_path_text}"));
     }
-    let limactl = find_executable("limactl")
-        .ok_or_else(|| "Lima is not installed. Install it before using Orvex CLI commands.".to_owned())?;
-    let mut invocation = Command::new(limactl);
-    invocation.env("LIMA_HOME", &lima_home).args(["shell", "--workdir", &guest_path_text, &instance_name]);
+    #[cfg(windows)]
+    let mut invocation = windows_runtime::shell(&lima_home, &instance_name, &guest_path_text)?;
+    #[cfg(not(windows))]
+    let mut invocation = {
+        let limactl = find_executable("limactl")
+            .ok_or_else(|| "Lima is not installed. Install it before using Orvex CLI commands.".to_owned())?;
+        let mut invocation = Command::new(limactl);
+        invocation.env("LIMA_HOME", &lima_home).args(["shell", "--workdir", &guest_path_text, &instance_name]);
+        invocation
+    };
     if network {
         invocation.args(command);
     } else {
@@ -2183,8 +2218,8 @@ pub fn cli_main() -> i32 {
         println!("orvex {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
-    if !cfg!(target_os = "macos") {
-        eprintln!("orvex: workspace execution currently requires the macOS Lima runtime.");
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        eprintln!("orvex: workspace execution requires macOS or Windows.");
         return 1;
     }
     let result = match args.first().map(String::as_str) {
@@ -2264,7 +2299,7 @@ async fn install_lima() -> Result<LimaStatus, String> {
 #[tauri::command]
 async fn get_vm_status(app: AppHandle) -> Result<VmStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if find_executable("limactl").is_none() {
+        if !inspect_lima().installed {
             return Ok(make_vm_status("notCreated".into(), POC_INSTANCE));
         }
         let home = app_lima_home(&app)?;
