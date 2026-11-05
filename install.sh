@@ -101,7 +101,6 @@ if [ "$download_only" = true ]; then
   exit 0
 fi
 
-if pgrep -u "$(id -u)" -x orvex-desktop >/dev/null; then fail 'Quit Orvex before installing an update.'; fi
 if [ -z "$install_dir" ]; then
   if [ -d "$HOME/Applications/Orvex.app" ]; then install_dir="$HOME/Applications"
   elif [ -d /Applications/Orvex.app ] || [ -w /Applications ]; then install_dir=/Applications
@@ -110,6 +109,9 @@ fi
 mkdir -p "$install_dir"
 [ -w "$install_dir" ] || fail "Cannot write to $install_dir. Try --install-dir \"$HOME/Applications\"."
 destination="$install_dir/Orvex.app"
+if ps -u "$(id -u)" -o comm= | awk -v target="$destination/Contents/MacOS/orvex-desktop" '{ sub(/^[ \t]+/, ""); if ($0 == target) found=1 } END { exit !found }'; then
+  fail 'Quit the Orvex app at this installation path before updating it.'
+fi
 [ ! -L "$destination" ] || fail 'Refusing to replace a symlink at the application destination.'
 stage="$(mktemp -d "$install_dir/.orvex-install.XXXXXXXX")"
 tar -tzf "$work/$asset" > "$work/entries"
@@ -120,7 +122,20 @@ app="$stage/unpacked/Orvex.app"
 [ -f "$app/Contents/MacOS/orvex-desktop" ] || fail 'The archive does not contain the Orvex executable.'
 [ "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = com.orvex.desktop ] || fail 'Unexpected application identifier.'
 [ "$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")" = "$resolved" ] || fail 'The app version does not match the release.'
-codesign --verify --deep --strict "$app" || fail 'Application code signature verification failed.'
+if ! codesign --verify --deep --strict "$app" 2>"$work/codesign-error"; then
+  # Early betas carried only the linker's ad-hoc executable signature, without
+  # sealing the bundle resources. Repair that specific legacy case after the
+  # release checksum/identity checks; never replace a Developer ID signature.
+  details="$(codesign -d --verbose=4 "$app" 2>&1)" || fail 'Could not inspect the application code signature.'
+  if [[ "$details" = *'Signature=adhoc'* ]] && [[ "$details" = *'linker-signed'* ]] && [[ "$details" = *'Sealed Resources=none'* ]]; then
+    printf 'Sealing the verified beta application bundle with an ad-hoc signature…\n'
+    codesign --force --deep --sign - "$app"
+    codesign --verify --deep --strict "$app" || fail 'Application code signature verification failed.'
+  else
+    cat "$work/codesign-error" >&2
+    fail 'Application code signature verification failed.'
+  fi
+fi
 if [ -e "$destination" ]; then mv "$destination" "$stage/previous.app"; fi
 mv "$app" "$destination"
 printf 'Installed Orvex %s at %s\nOpen Orvex from that location.\n' "$resolved" "$destination"
