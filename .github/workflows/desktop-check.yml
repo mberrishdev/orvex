@@ -29,6 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @orvex/desktop test:updates
+      - run: pnpm --filter @orvex/desktop test:mcp
       - run: python scripts/test-release-artifacts.py
       - name: Test macOS installer without installing
         if: runner.os == 'macOS'
