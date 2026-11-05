@@ -122,6 +122,6 @@ jobs:
           # Beta clients also graduate to stable releases through this feed.
           # Never publish a partial manifest while either platform is still building.
           if ! gh release view updater-beta >/dev/null 2>&1; then
-            gh release create updater-beta --target "$GITHUB_SHA" --prerelease --latest=false --title "Beta update feed" --notes "Machine-readable update feed. Install from a versioned Orvex release."
+            gh release create updater-beta --target "$GITHUB_SHA" --prerelease --latest=false --title "Orvex Beta Update Channel" --notes "Rolling updater manifest for beta installations. Install from a versioned Orvex release."
           fi
           gh release upload updater-beta release/latest.json --clobber
