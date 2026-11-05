@@ -61,6 +61,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Test desktop update flow
         run: pnpm --filter @orvex/desktop test:updates
+      - name: Test MCP onboarding
+        run: pnpm --filter @orvex/desktop test:mcp
       - name: Build frontend assets for Rust tests
         run: pnpm --filter @orvex/desktop build
       - name: Test shared Rust code

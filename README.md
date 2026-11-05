@@ -18,6 +18,26 @@ pnpm dev
 
 `pnpm dev` launches the Tauri desktop application. `pnpm build` checks and builds the frontend; `pnpm check:rust` checks the Rust workspace.
 
+## Connect your AI
+
+In **Agent connections**, choose **Connect your AI** and select Codex, Claude Code,
+GitHub Copilot CLI, Pi, Cursor, or Gemini CLI. Orvex previews the user configuration
+path and adds its local MCP server when you click **Add**. Existing settings and
+other servers are preserved; existing files receive a sibling `orvex-backup-*`
+copy. Conflicting Orvex entries and malformed configurations require manual review.
+Custom client configuration directories are respected for Codex, Copilot, and Pi.
+
+Restart your AI client or reload its MCP servers, then ask it to list your Orvex
+workspaces. The app shows a live connection only after an MCP handshake. Pi requires
+a version with built-in MCP support; older versions may need an extension. Other
+MCP clients can use the copyable JSON configuration (adapt the top-level key to the
+client). These connections target clients on the host computer, outside workspace VMs.
+
+The desktop executable also accepts `mcp` to serve over stdio without opening a
+window, so no separate CLI installation is needed. Keep the installed app at the
+configured path; reconnect from setup if you move it. Development configurations
+point to the development build and should be added again from the installed app.
+
 ## Desktop updates
 
 The macOS Apple Silicon and Windows x64 builds check the latest GitHub release and can install signed updates in-app. Release builds require the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and, when the key is password-protected, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Generate the key pair with `pnpm --filter @orvex/desktop exec tauri signer generate`; keep the private key only in GitHub Actions secrets and place the generated `.pub` value in `apps/desktop/src-tauri/tauri.conf.json`.

@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { AppUpdates } from "../features/updates/AppUpdates";
 import "../styles/workspaces.css";
 import { Sidebar } from "../features/workspaces/Sidebar";
+import { McpSetup } from "../features/workspaces/McpSetup";
 import { McpStatus } from "../features/workspaces/McpStatus";
 import { useMcpStatus } from "../features/workspaces/useMcpStatus";
 import { BrandMark } from "../components/BrandMark";
@@ -25,6 +26,7 @@ function workspaceSlugPreview(name: string) {
 
 function App() {
   const mcpStatus = useMcpStatus();
+  const [mcpSetupOpen, setMcpSetupOpen] = useState(false);
   const [workspaceFilter, setWorkspaceFilter] = useState<"all" | "running">("all");
   const [info, setInfo] = useState<AppInfo | null>(null);
   const isWindows = info?.platform === "windows";
@@ -467,7 +469,7 @@ function App() {
               {installing ? <><span className="spinner"/> Installing…</> : "Install Lima"}
             </button>}
       </section>
-      <McpStatus status={mcpStatus.status} error={mcpStatus.error} />
+      <McpStatus status={mcpStatus.status} error={mcpStatus.error} onConnect={() => setMcpSetupOpen(true)} />
       </div>
       {workspaces.some((workspace) => !workspace.vmName) && <section className="vm-card" aria-live="polite">
         <div className="vm-heading">
@@ -582,6 +584,7 @@ function App() {
       <AppUpdates busy={workspaceCreating || workspaceDeleting !== null || workspaceVmAction !== null || vmAction !== null || workspaceServiceAction !== null || installing} />
       <footer className="footer"><span>Made for a little more focus.</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
+    {mcpSetupOpen && <McpSetup status={mcpStatus.status} statusError={mcpStatus.error} refresh={mcpStatus.refresh} onClose={() => setMcpSetupOpen(false)} />}
     <dialog ref={deleteDialogRef} className="workspace-dialog workspace-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-workspace-title" aria-describedby="delete-workspace-description" onCancel={(event) => { event.preventDefault(); if (workspaceDeleting === null) setPendingWorkspaceDelete(null); }}>
       {pendingWorkspaceDelete && <>
         <div className="eyebrow">DELETE WORKSPACE</div>

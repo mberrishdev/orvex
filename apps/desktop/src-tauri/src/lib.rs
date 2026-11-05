@@ -1,6 +1,7 @@
 #[cfg(any(windows, test))]
 mod windows_runtime;
 mod mcp_connections;
+mod mcp_setup;
 mod environment_plan;
 mod project_configuration;
 mod project_requirements;
@@ -1878,6 +1879,16 @@ fn provision_workspace_dependencies(
 }
 
 #[tauri::command]
+async fn get_mcp_setup(provider: String) -> Result<mcp_setup::Setup, String> {
+    tauri::async_runtime::spawn_blocking(move || mcp_setup::inspect(&provider)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn install_mcp_setup(provider: String) -> Result<mcp_setup::Setup, String> {
+    tauri::async_runtime::spawn_blocking(move || mcp_setup::install(&provider)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn get_mcp_status(app: AppHandle) -> Result<mcp_connections::Status, String> {
     let directory=app.path().app_data_dir().map_err(|e|e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || mcp_connections::status(&directory)).await.map_err(|e|e.to_string())?
@@ -2413,6 +2424,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             get_mcp_status,
+            get_mcp_setup,
+            install_mcp_setup,
             list_workspaces,
             create_workspace,
             run_workspace_setup,
