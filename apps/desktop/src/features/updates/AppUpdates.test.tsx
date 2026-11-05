@@ -3,10 +3,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { AppUpdates } from "./AppUpdates";
 
 const mocks = vi.hoisted(() => ({ check: vi.fn(), relaunch: vi.fn() }));
-vi.mock("@tauri-apps/plugin-updater", () => ({ check: mocks.check }));
+vi.mock("./checkForUpdates", () => ({ checkForChannelUpdates: mocks.check }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: mocks.relaunch }));
 
-beforeEach(() => { vi.stubEnv("DEV", true); mocks.check.mockReset(); mocks.relaunch.mockReset(); });
+beforeEach(() => { localStorage.clear(); vi.stubEnv("DEV", true); mocks.check.mockReset(); mocks.relaunch.mockReset(); });
 afterEach(() => { cleanup(); vi.unstubAllEnvs(); });
 
 async function discover(update: unknown, busy = false) {
@@ -76,5 +76,44 @@ describe("signed desktop update flow", () => {
     expect(screen.getByRole("button", { name: "Install update" })).toHaveProperty("disabled", true);
     fireEvent.click(screen.getByRole("button", { name: "Install update" }));
     expect(install).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("update channel selection", () => {
+  it("defaults beta builds to beta and persists a stable choice", async () => {
+    mocks.check.mockResolvedValue(null);
+    const view = render(<AppUpdates busy={false} />);
+    expect(screen.getByRole("combobox", { name: "Release channel" })).toHaveProperty("value", "beta");
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "stable" } });
+    await screen.findByText("You’re up to date.");
+    expect(mocks.check).toHaveBeenLastCalledWith("stable");
+    expect(localStorage.getItem("orvex.updateChannel")).toBe("stable");
+    view.unmount();
+    render(<AppUpdates busy={false} />);
+    expect(screen.getByRole("combobox")).toHaveProperty("value", "stable");
+  });
+
+  it("discards a previous channel's update even when the new check fails", async () => {
+    const close = vi.fn();
+    await discover({ version: "2.0.0-beta.1", close, downloadAndInstall: vi.fn() });
+    mocks.check.mockRejectedValueOnce(new Error("feed unavailable"));
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "stable" } });
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("button", { name: "Install update" })).toBeNull();
+    mocks.check.mockResolvedValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    await screen.findByText("You’re up to date.");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("prevents changing channel during download and before restart", async () => {
+    let finish!: () => void;
+    await discover({ version: "2.0.0", close: vi.fn(), downloadAndInstall: vi.fn(() => new Promise<void>((resolve) => { finish = resolve; })) });
+    fireEvent.click(screen.getByRole("button", { name: "Install update" }));
+    expect(screen.getByRole("combobox")).toHaveProperty("disabled", true);
+    finish();
+    await screen.findByRole("button", { name: "Restart Orvex" });
+    expect(screen.getByRole("combobox")).toHaveProperty("disabled", true);
   });
 });
