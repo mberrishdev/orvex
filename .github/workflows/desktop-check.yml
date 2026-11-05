@@ -30,6 +30,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @orvex/desktop test:updates
       - run: python scripts/test-release-artifacts.py
+      - name: Test macOS installer without installing
+        if: runner.os == 'macOS'
+        run: python3 scripts/test-install-sh.py
+      - name: Test Windows installer without installing
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-install.ps1
       - run: pnpm build
       - run: cargo test --locked --workspace --lib --features custom-protocol
       - run: cargo build --locked --workspace --features custom-protocol
