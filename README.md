@@ -40,7 +40,7 @@ point to the development build and should be added again from the installed app.
 
 ## Desktop updates
 
-The macOS Apple Silicon and Windows x64 builds check the latest GitHub release and can install signed updates in-app. Release builds require the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and, when the key is password-protected, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Generate the key pair with `pnpm --filter @orvex/desktop exec tauri signer generate`; keep the private key only in GitHub Actions secrets and place the generated `.pub` value in `apps/desktop/src-tauri/tauri.conf.json`.
+Open **Settings → Software updates** to check for, install, and restart into signed updates on macOS Apple Silicon and Windows x64. Choose **Stable** for stable releases or **Beta** for previews and stable releases. The channel is saved on this device; beta builds default to Beta. Switching channels never downgrades the installed version. Update checks continue automatically at startup and every six hours, including while you use Workspaces. Installation and restart wait until current workspace operations finish. Release builds require the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and, when the key is password-protected, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Generate the key pair with `pnpm --filter @orvex/desktop exec tauri signer generate`; keep the private key only in GitHub Actions secrets and place the generated `.pub` value in `apps/desktop/src-tauri/tauri.conf.json`.
 
 ## Current capabilities
 

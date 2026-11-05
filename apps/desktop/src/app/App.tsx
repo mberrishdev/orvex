@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { AppUpdates } from "../features/updates/AppUpdates";
+import { Settings } from "../features/settings/Settings";
 import "../styles/workspaces.css";
 import { Sidebar } from "../features/workspaces/Sidebar";
 import { McpSetup } from "../features/workspaces/McpSetup";
@@ -27,6 +27,18 @@ function workspaceSlugPreview(name: string) {
 function App() {
   const mcpStatus = useMcpStatus();
   const [mcpSetupOpen, setMcpSetupOpen] = useState(false);
+  const [page, setPage] = useState<"workspaces" | "settings">(() => window.location.hash === "#settings" ? "settings" : "workspaces");
+
+  function navigate(next: "workspaces" | "settings") {
+    setPage(next);
+    window.location.hash = next;
+  }
+
+  useEffect(() => {
+    const syncPage = () => setPage(window.location.hash === "#settings" ? "settings" : "workspaces");
+    window.addEventListener("hashchange", syncPage);
+    return () => window.removeEventListener("hashchange", syncPage);
+  }, []);
   const [workspaceFilter, setWorkspaceFilter] = useState<"all" | "running">("all");
   const [info, setInfo] = useState<AppInfo | null>(null);
   const isWindows = info?.platform === "windows";
@@ -445,8 +457,8 @@ function App() {
   }
 
   return <main className="shell">
-    <Sidebar workspaces={workspaces} runningCount={workspaces.filter(w => workspaceVms[w.id]?.state === "running").length} filter={workspaceFilter} onFilter={setWorkspaceFilter} platform={info?.platform} runtimeReady={!!lima?.installed} />
-    <section className="content">
+    <Sidebar workspaces={workspaces} runningCount={workspaces.filter(w => workspaceVms[w.id]?.state === "running").length} filter={workspaceFilter} page={page} onSettings={() => navigate("settings")} onFilter={(filter) => { setWorkspaceFilter(filter); navigate("workspaces"); }} platform={info?.platform} runtimeReady={!!lima?.installed} />
+    <section className="content" hidden={page !== "workspaces"}>
       <header className="topbar" data-tauri-drag-region><span>Orvex <span className="breadcrumb-divider">/</span> Workspaces</span><div className="topbar-actions"><span className="topbar-local"><span className="local-indicator"/> On your machine</span><button type="button" className="secondary-button refresh-button" aria-label="Refresh workspaces" aria-busy={refreshing} disabled={refreshing || workspaceCreating || workspaceDeleting !== null || workspaceVmAction !== null || vmAction !== null || workspaceServiceAction !== null} onClick={() => void refreshWorkspaces()}><svg className={refreshing ? "refresh-icon spinning" : "refresh-icon"} width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3a7 7 0 0 0 11.5-1"/></svg>{refreshing ? "Refreshing…" : "Refresh"}</button></div></header>
       <div className="page-heading"><div><div className="eyebrow">YOUR SPACE TO BUILD</div><h1>Workspaces</h1><p>A fresh environment for every idea. All on your machine.</p></div><button className="primary-button" onClick={openWorkspaceDialog}><span aria-hidden="true">＋</span> New workspace</button></div>
       {isWindows && <div className="notice beta-notice" role="status"><strong>Windows beta · WSL 2</strong><p>Each workspace uses a separate Linux distribution. WSL distributions share a kernel and are intended for trusted development, not untrusted-code containment.</p></div>}
@@ -581,10 +593,10 @@ function App() {
           {workspaceSetupErrors[w.id] && <small className="workspace-setup-result workspace-setup-failed">Setup config: {workspaceSetupErrors[w.id]}</small>}
         </article>;
       })}</div>}
-      <AppUpdates busy={workspaceCreating || workspaceDeleting !== null || workspaceVmAction !== null || vmAction !== null || workspaceServiceAction !== null || installing} />
       <footer className="footer"><span>Made for a little more focus.</span><span>{info ? `${info.name} · ${info.version}` : "Starting controller…"}</span></footer>
     </section>
     {mcpSetupOpen && <McpSetup status={mcpStatus.status} statusError={mcpStatus.error} refresh={mcpStatus.refresh} onClose={() => setMcpSetupOpen(false)} />}
+    <Settings hidden={page !== "settings"} info={info} busy={workspaceCreating || workspaceDeleting !== null || workspaceVmAction !== null || vmAction !== null || workspaceServiceAction !== null || agentPreflightAction !== null || terminalAction !== null || installing} />
     <dialog ref={deleteDialogRef} className="workspace-dialog workspace-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-workspace-title" aria-describedby="delete-workspace-description" onCancel={(event) => { event.preventDefault(); if (workspaceDeleting === null) setPendingWorkspaceDelete(null); }}>
       {pendingWorkspaceDelete && <>
         <div className="eyebrow">DELETE WORKSPACE</div>

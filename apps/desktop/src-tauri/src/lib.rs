@@ -2,6 +2,7 @@
 mod windows_runtime;
 mod mcp_connections;
 mod mcp_setup;
+mod updates;
 mod environment_plan;
 mod project_configuration;
 mod project_requirements;
@@ -2422,6 +2423,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            updates::check_for_app_update,
             get_app_info,
             get_mcp_status,
             get_mcp_setup,

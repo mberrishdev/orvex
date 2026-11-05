@@ -62,7 +62,7 @@ def collect(root, bundle, output, platform, tag):
     (output / f"latest-{platform}.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def merge(artifacts, output):
+def merge(artifacts, output, installer_root=None):
     manifests = list(artifacts.glob("**/latest-*.json"))
     combined = None
     platforms = {}
@@ -95,6 +95,9 @@ def merge(artifacts, output):
             shutil.copyfile(source, destination)
     combined["platforms"] = platforms
     (output / "latest.json").write_text(json.dumps(combined, indent=2) + "\n")
+    if installer_root is not None:
+        for name in ["install.sh", "install.ps1"]:
+            shutil.copyfile(installer_root / name, output / name)
     checksums = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}" for p in sorted(output.iterdir()) if p.is_file()]
     (output / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n")
 
@@ -114,4 +117,4 @@ if __name__ == "__main__":
     elif args.operation == "collect":
         collect(args.root, args.bundle, args.output, args.platform, args.tag)
     else:
-        merge(args.artifacts, args.output)
+        merge(args.artifacts, args.output, args.root)
