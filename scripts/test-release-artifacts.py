@@ -57,6 +57,18 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.collect("macos")
 
+    def test_install_scripts_are_included_in_release_checksums(self):
+        self.collect("macos")
+        self.collect("windows")
+        for name in ["install.sh", "install.ps1"]:
+            (self.root / name).write_text("installer fixture")
+        output = self.root / "release"
+        release.merge(self.artifacts, output, self.root)
+        checksums = (output / "SHA256SUMS.txt").read_text()
+        for name in ["install.sh", "install.ps1"]:
+            self.assertEqual((output / name).read_text(), "installer fixture")
+            self.assertIn("  " + name, checksums)
+
     def test_missing_platform_fails(self):
         self.collect("windows")
         with self.assertRaises(ValueError):
